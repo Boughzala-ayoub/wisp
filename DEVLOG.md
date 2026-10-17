@@ -77,3 +77,42 @@ Things that surprised me:
   wants the same behavior has to set the default blink state on the terminal itself.
 - **Shaping dominates the frame.** Before the cache, almost all of the 2.7 ms went to DirectWrite
   analyzing and shaping runs that hadn't changed since the last frame.
+
+## M3: mouse and clipboard
+
+*2026-10-17*
+
+![A drag selection in Wisp](docs/devlog/m3-selection.png)
+
+Dragging selects text, double-click selects a word and triple-click a line. Right-click copies the
+selection, or pastes when nothing is selected, like conhost and Windows Terminal. Ctrl+Shift+C/V
+and Ctrl/Shift+Insert copy and paste, Ctrl+Shift+A selects everything, and the wheel and
+Shift+PageUp/PageDown scroll through history. Dragging past the top or bottom edge keeps scrolling.
+Pasting several lines into a shell that would run them right away asks first, like Ghostty's
+clipboard-paste-protection. Programs can set the clipboard with OSC 52.
+
+When a program asks for the mouse, clicks and the wheel go to it instead, and Shift still selects.
+The selection logic is libghostty-vt's own gesture state machine, so clicks, drags and repeat-click
+timing behave the way they do in Ghostty.
+
+| | |
+|---|---|
+| Text weight vs. Direct2D | within 2% of Windows' own rendering of the same line, now checked by a test |
+| Tests | 30, plus 2 opt-in (a benchmark, and one that overwrites the clipboard) |
+
+Things that surprised me:
+
+- **Mouse tracking survives ConPTY.** I expected conhost to swallow a WSL program's request for
+  mouse reports. It doesn't on this Windows build. With `WISP_TRACE_PTY=1` you can watch
+  `ESC[?1000h ESC[?1006h` arrive from bash, a click leave as `ESC[<0;10;8M`, and `cat -v` echo it
+  back from inside WSL.
+- **M2's contrast curve never ran.** The shader constants were bound to the vertex shader only, so
+  the pixel shader read zeros and the "light text" correction did nothing. I only noticed while
+  checking why text looked heavy, and the honest check turned out to be a reference rather than my
+  eyes: the new test renders the same line with Direct2D, which applies DirectWrite's own gamma
+  and contrast. Without the curve, Wisp's text had 3.5% less ink than Direct2D's. The strength I
+  had picked by eye would have made it 12% heavier. The calibrated value lands within 2%.
+- **The clipboard didn't get a live test.** The machine's clipboard held rich browser content that
+  couldn't be restored exactly, so copy and paste ran only through unit tests and one opt-in test
+  that overwrites the clipboard. Selection, wheel scrolling and mouse reports were checked in the
+  real window.

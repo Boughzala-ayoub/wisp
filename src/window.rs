@@ -9,29 +9,40 @@ use std::cell::RefCell;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use libghostty_vt::terminal::SizeReportSize;
-use windows::Win32::Foundation::{HANDLE, HWND, LPARAM, LRESULT, RECT, WAIT_OBJECT_0, WPARAM};
+use libghostty_vt::key::Mods;
+use libghostty_vt::selection::gesture::Autoscroll;
+use libghostty_vt::terminal::{ScrollViewport, SizeReportSize};
+use windows::Win32::Foundation::{HANDLE, HWND, LPARAM, LRESULT, POINT, RECT, WAIT_OBJECT_0, WPARAM};
 use windows::Win32::Graphics::Dwm::{
     DWMWA_BORDER_COLOR, DWMWA_CAPTION_COLOR, DWMWA_USE_IMMERSIVE_DARK_MODE, DwmSetWindowAttribute,
 };
-use windows::Win32::Graphics::Gdi::{BeginPaint, EndPaint, PAINTSTRUCT};
+use windows::Win32::Graphics::Gdi::{BeginPaint, EndPaint, PAINTSTRUCT, ScreenToClient};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::{INFINITE, WaitForSingleObject};
 use windows::Win32::UI::HiDpi::{AdjustWindowRectExForDpi, GetDpiForWindow};
-use windows::Win32::UI::Input::KeyboardAndMouse::{VK_F4, VK_PACKET, VK_PROCESSKEY};
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    GetKeyState, ReleaseCapture, SetCapture, VIRTUAL_KEY, VK_A, VK_C, VK_CAPITAL, VK_CONTROL, VK_DOWN, VK_F4,
+    VK_INSERT, VK_LWIN, VK_MENU, VK_NEXT, VK_NUMLOCK, VK_PACKET, VK_PRIOR, VK_PROCESSKEY, VK_RWIN, VK_SHIFT, VK_UP,
+    VK_V,
+};
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::{BOOL, HSTRING, PCWSTR, w};
 
+use crate::clipboard;
 use crate::font::Font;
 use crate::input::{KeyEvent, control_key_state};
+use crate::mouse::{Button, Layout, Mouse, Wheel};
 use crate::render::{Renderer, Surface};
 use crate::term::Pane;
 
 const WM_APP_OUTPUT: u32 = WM_APP + 1;
+const WM_APP_EXITED: u32 = WM_APP + 2;
 const BLINK_TIMER: usize = 1;
 /// Ghostty's cursor blink interval.
 const BLINK_MS: u32 = 600;
-const WM_APP_EXITED: u32 = WM_APP + 2;
+/// While a selection is dragged past the top or bottom edge, scroll a line this often.
+const AUTOSCROLL_TIMER: usize = 2;
+const AUTOSCROLL_MS: u32 = 40;
 const CLASS_NAME: PCWSTR = w!("WispWindow");
 
 const FONT_FAMILY: &str = "Cascadia Code";
@@ -43,6 +54,50 @@ const INITIAL_ROWS: u16 = 30;
 thread_local! {
     /// Every open window, so the message loop knows whose frames to pace.
     static WINDOWS: RefCell<Vec<HWND>> = const { RefCell::new(Vec::new()) };
+}
+
+/// What a key binding can do. These are Ghostty's action names, so they can
+/// map one to one onto `keybind` lines once bindings come from the config.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Action {
+    CopyToClipboard,
+    PasteFromClipboard,
+    SelectAll,
+    ScrollPageUp,
+    ScrollPageDown,
+}
+
+/// Ghostty's default bindings for Linux and Windows. Shift+Home and Shift+End
+/// (scroll to top and bottom in Ghostty) are left out on purpose: PSReadLine
+/// uses them to select text, and that matters more in PowerShell.
+fn default_binding(vk: VIRTUAL_KEY, mods: Mods) -> Option<Action> {
+    let ctrl_shift = Mods::CTRL | Mods::SHIFT;
+    match vk {
+        VK_C if mods == ctrl_shift => Some(Action::CopyToClipboard),
+        VK_V if mods == ctrl_shift => Some(Action::PasteFromClipboard),
+        VK_A if mods == ctrl_shift => Some(Action::SelectAll),
+        VK_INSERT if mods == Mods::CTRL => Some(Action::CopyToClipboard),
+        VK_INSERT if mods == Mods::SHIFT => Some(Action::PasteFromClipboard),
+        VK_PRIOR if mods == Mods::SHIFT => Some(Action::ScrollPageUp),
+        VK_NEXT if mods == Mods::SHIFT => Some(Action::ScrollPageDown),
+        _ => None,
+    }
+}
+
+/// The modifier keys held right now.
+fn current_mods() -> Mods {
+    let down = |vk: VIRTUAL_KEY| unsafe { GetKeyState(vk.0 as i32) } < 0;
+    let mut mods = Mods::empty();
+    mods.set(Mods::SHIFT, down(VK_SHIFT));
+    mods.set(Mods::CTRL, down(VK_CONTROL));
+    mods.set(Mods::ALT, down(VK_MENU));
+    mods.set(Mods::SUPER, down(VK_LWIN) || down(VK_RWIN));
+    mods
+}
+
+fn is_modifier(vk: VIRTUAL_KEY) -> bool {
+    matches!(vk, VK_SHIFT | VK_CONTROL | VK_MENU | VK_LWIN | VK_RWIN | VK_CAPITAL | VK_NUMLOCK)
+        || (0xA0..=0xA5).contains(&vk.0) // left and right Shift, Ctrl, Alt
 }
 
 pub struct Window {
@@ -64,6 +119,9 @@ pub struct Window {
     output_pending: Arc<AtomicBool>,
     /// Until the first frame is presented, for the startup-time log.
     first_frame: bool,
+    /// The last pointer position in client pixels, for autoscroll ticks.
+    pointer: (f32, f32),
+    autoscroll_timer: bool,
 }
 
 impl Window {
@@ -144,6 +202,8 @@ impl Window {
                 frame_ready: false,
                 output_pending,
                 first_frame: true,
+                pointer: (0.0, 0.0),
+                autoscroll_timer: false,
             };
             SetWindowLongPtrW(hwnd, GWLP_USERDATA, Box::into_raw(Box::new(RefCell::new(window))) as isize);
             WINDOWS.with_borrow_mut(|w| w.push(hwnd));
@@ -244,6 +304,17 @@ impl Window {
         if vk == VK_PROCESSKEY.0 {
             return false;
         }
+        if down && let Some(action) = default_binding(VIRTUAL_KEY(vk), current_mods()) {
+            take_typed_chars(self.hwnd); // e.g. the ^V that Ctrl+Shift+V would type
+            self.perform(action);
+            return true;
+        }
+        if down && !is_modifier(VIRTUAL_KEY(vk)) {
+            // Like Ghostty: typing jumps back to the live screen and drops the selection.
+            self.pane.scroll(ScrollViewport::Bottom);
+            self.pane.clear_selection();
+            self.dirty = true;
+        }
         if !self.pane.win32_input {
             // ponytail: without win32-input-mode only typed text gets through (via WM_CHAR).
             // conhost always asks for the mode, so a VT key encoder waits for a backend that doesn't.
@@ -276,6 +347,163 @@ impl Window {
         true
     }
 
+    fn perform(&mut self, action: Action) {
+        let page = self.pane.terminal.rows().unwrap_or(1) as isize;
+        match action {
+            Action::CopyToClipboard => {
+                self.copy_selection();
+            }
+            Action::PasteFromClipboard => self.paste_clipboard(),
+            Action::SelectAll => {
+                let term = &self.pane.terminal;
+                if let Ok(Some(all)) = term.select_all() {
+                    let _ = term.set_selection(Some(&all));
+                }
+            }
+            Action::ScrollPageUp => self.pane.scroll(ScrollViewport::Delta(-page)),
+            Action::ScrollPageDown => self.pane.scroll(ScrollViewport::Delta(page)),
+        }
+        self.dirty = true;
+    }
+
+    /// Copies the selection, if there is one. Returns whether there was.
+    fn copy_selection(&mut self) -> bool {
+        let Some(text) = self.pane.selection_text() else { return false };
+        clipboard::set_text(Some(self.hwnd), &text);
+        true
+    }
+
+    fn paste_clipboard(&mut self) {
+        let Some(text) = clipboard::get_text(Some(self.hwnd)).filter(|t| !t.is_empty()) else { return };
+        if self.pane.paste_needs_confirmation(&text) && !confirm_paste(self.hwnd, &text) {
+            return;
+        }
+        self.pane.scroll(ScrollViewport::Bottom);
+        self.pane.paste(&text);
+    }
+
+    fn layout(&self) -> Layout {
+        Layout {
+            width: self.surface.width,
+            height: self.surface.height,
+            cell_width: self.font.cell_width,
+            cell_height: self.font.cell_height,
+            padding: padding_px(self.dpi),
+        }
+    }
+
+    fn mouse_button(&mut self, button: Button, down: bool, x: f32, y: f32) {
+        let (mods, layout) = (current_mods(), self.layout());
+        self.pointer = (x, y);
+        // Right-click copies the selection, or pastes when there is none,
+        // the way conhost and Windows Terminal do (Ghostty's copy-or-paste).
+        if button == Button::Right && down && !Mouse::reports(&self.pane.terminal, mods) {
+            if self.copy_selection() {
+                self.pane.clear_selection();
+            } else {
+                self.paste_clipboard();
+            }
+            self.dirty = true;
+            return;
+        }
+        unsafe {
+            if down {
+                SetCapture(self.hwnd);
+            } else {
+                let _ = ReleaseCapture();
+            }
+        }
+        let mut out = Vec::new();
+        let Pane { mouse, terminal, .. } = &mut self.pane;
+        let result = if down {
+            mouse.press(terminal, button, x, y, mods, layout, &mut out)
+        } else {
+            mouse.release(terminal, button, x, y, mods, layout, &mut out)
+        };
+        if let Err(e) = result {
+            eprintln!("mouse button: {e}");
+        }
+        self.pane.write(&out);
+        self.run_autoscroll_timer();
+        self.dirty = true;
+    }
+
+    fn mouse_moved(&mut self, x: f32, y: f32) {
+        self.pointer = (x, y);
+        let (mods, layout) = (current_mods(), self.layout());
+        let mut out = Vec::new();
+        let Pane { mouse, terminal, .. } = &mut self.pane;
+        let selecting = mouse.is_selecting();
+        if let Err(e) = mouse.moved(terminal, x, y, mods, layout, &mut out) {
+            eprintln!("mouse move: {e}");
+        }
+        self.pane.write(&out);
+        if selecting {
+            self.run_autoscroll_timer();
+            self.dirty = true;
+        }
+    }
+
+    /// `notches` is in wheel detents; positive turns away from the user (up).
+    fn mouse_wheel(&mut self, notches: f32, x: f32, y: f32) {
+        let (mods, layout) = (current_mods(), self.layout());
+        let mut out = Vec::new();
+        let lines = notches * wheel_scroll_lines();
+        let Pane { mouse, terminal, .. } = &mut self.pane;
+        match mouse.wheel(terminal, lines, x, y, mods, layout, &mut out) {
+            Ok(Wheel::Arrows(presses)) => {
+                let vk = if presses < 0 { VK_UP } else { VK_DOWN };
+                for _ in 0..presses.unsigned_abs() {
+                    self.send_key(vk);
+                }
+            }
+            Ok(Wheel::Handled) => {}
+            Err(e) => eprintln!("mouse wheel: {e}"),
+        }
+        self.pane.write(&out);
+        self.dirty = true;
+    }
+
+    /// Sends one press and release of a key that types nothing (arrows and the like).
+    fn send_key(&self, vk: VIRTUAL_KEY) {
+        if !self.pane.win32_input {
+            let seq: &[u8] = if vk == VK_UP { b"\x1b[A" } else { b"\x1b[B" };
+            self.pane.write(seq);
+            return;
+        }
+        use windows::Win32::UI::Input::KeyboardAndMouse::{MAPVK_VK_TO_VSC, MapVirtualKeyW};
+        let scan = unsafe { MapVirtualKeyW(vk.0 as u32, MAPVK_VK_TO_VSC) } as u16;
+        let event = KeyEvent { vk: vk.0, scan, ch: 0, down: true, state: control_key_state(true), repeat: 1 };
+        let out = event.encode() + &KeyEvent { down: false, ..event }.encode();
+        self.pane.write(out.as_bytes());
+    }
+
+    /// Runs the autoscroll timer while a selection is dragged past an edge.
+    fn run_autoscroll_timer(&mut self) {
+        let wanted = self.pane.mouse.autoscroll(&self.pane.terminal) != Autoscroll::None;
+        if wanted == self.autoscroll_timer {
+            return;
+        }
+        unsafe {
+            if wanted {
+                SetTimer(Some(self.hwnd), AUTOSCROLL_TIMER, AUTOSCROLL_MS, None);
+            } else {
+                let _ = KillTimer(Some(self.hwnd), AUTOSCROLL_TIMER);
+            }
+        }
+        self.autoscroll_timer = wanted;
+    }
+
+    fn autoscroll_tick(&mut self) {
+        let ((x, y), layout) = (self.pointer, self.layout());
+        let Pane { mouse, terminal, .. } = &mut self.pane;
+        if let Err(e) = mouse.autoscroll_tick(terminal, x, y, layout) {
+            eprintln!("autoscroll: {e}");
+        }
+        self.run_autoscroll_timer();
+        self.dirty = true;
+    }
+
     /// Characters that arrive without a key event of their own: IME results.
     fn char(&mut self, ch: u16) {
         if self.pane.win32_input {
@@ -306,6 +534,37 @@ fn take_typed_chars(hwnd: HWND) -> Vec<u16> {
     chars
 }
 
+/// Asks before pasting text that would run commands as it arrives. This is
+/// Ghostty's clipboard-paste-protection, on by default there too.
+fn confirm_paste(hwnd: HWND, text: &str) -> bool {
+    let lines = text.lines().count();
+    let preview: String =
+        text.lines().take(5).map(|l| format!("  {}\n", l.chars().take(80).collect::<String>())).collect();
+    let more = if lines > 5 { format!("  ...and {} more lines\n", lines - 5) } else { String::new() };
+    let message = format!(
+        "This text has {lines} lines. Pasting it may run commands before you can review them:\n\n{preview}{more}\nPaste anyway?"
+    );
+    let answer = unsafe {
+        MessageBoxW(Some(hwnd), &HSTRING::from(message), w!("Paste"), MB_OKCANCEL | MB_ICONWARNING | MB_DEFBUTTON2)
+    };
+    answer == IDOK
+}
+
+/// Lines to scroll per wheel notch, from the system mouse settings.
+fn wheel_scroll_lines() -> f32 {
+    let mut lines = 3u32;
+    unsafe {
+        let _ = SystemParametersInfoW(
+            SPI_GETWHEELSCROLLLINES,
+            0,
+            Some((&raw mut lines).cast()),
+            SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0),
+        );
+    }
+    // u32::MAX means "a page at a time"; a generous fixed amount will do.
+    if lines == u32::MAX { 10.0 } else { lines as f32 }
+}
+
 fn padding_px(dpi: u32) -> u32 {
     (PADDING_PT * dpi as f32 / 72.0).round() as u32
 }
@@ -331,6 +590,11 @@ fn style_title_bar(hwnd: HWND) {
         // The default 1px border is translucent and shows whatever is behind the window.
         let _ = DwmSetWindowAttribute(hwnd, DWMWA_BORDER_COLOR, (&raw const colorref).cast(), 4);
     }
+}
+
+/// The client-area position packed into a mouse message's lParam.
+fn client_point(lparam: LPARAM) -> (f32, f32) {
+    ((lparam.0 & 0xffff) as i16 as f32, ((lparam.0 >> 16) & 0xffff) as i16 as f32)
 }
 
 fn state(hwnd: HWND) -> Option<&'static RefCell<Window>> {
@@ -397,6 +661,41 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpar
             window.blink_on = !window.blink_on;
             window.dirty = true;
         }
+        WM_TIMER if wparam.0 == AUTOSCROLL_TIMER => window.autoscroll_tick(),
+        WM_LBUTTONDOWN | WM_LBUTTONUP | WM_MBUTTONDOWN | WM_MBUTTONUP | WM_RBUTTONDOWN | WM_RBUTTONUP => {
+            let button = match msg {
+                WM_LBUTTONDOWN | WM_LBUTTONUP => Button::Left,
+                WM_MBUTTONDOWN | WM_MBUTTONUP => Button::Middle,
+                _ => Button::Right,
+            };
+            let down = matches!(msg, WM_LBUTTONDOWN | WM_MBUTTONDOWN | WM_RBUTTONDOWN);
+            let (x, y) = client_point(lparam);
+            window.mouse_button(button, down, x, y);
+        }
+        WM_MOUSEMOVE => {
+            let (x, y) = client_point(lparam);
+            window.mouse_moved(x, y);
+        }
+        WM_MOUSEWHEEL => {
+            // Wheel messages carry screen coordinates, unlike the other mouse messages.
+            let mut p = POINT { x: (lparam.0 & 0xffff) as i16 as i32, y: ((lparam.0 >> 16) & 0xffff) as i16 as i32 };
+            let _ = unsafe { ScreenToClient(hwnd, &mut p) };
+            let notches = ((wparam.0 >> 16) & 0xffff) as i16 as f32 / WHEEL_DELTA as f32;
+            window.mouse_wheel(notches, p.x as f32, p.y as f32);
+        }
+        WM_CAPTURECHANGED if window.pane.mouse.is_selecting() => {
+            // Lost the mouse mid-drag (Alt+Tab, say): finish the selection where it is.
+            let (x, y) = window.pointer;
+            window.mouse_button(Button::Left, false, x, y);
+        }
+        WM_SETCURSOR if (lparam.0 & 0xffff) as u32 == HTCLIENT => {
+            // An arrow when clicks go to the program, an I-beam when they select text.
+            let shape = if Mouse::reports(&window.pane.terminal, current_mods()) { IDC_ARROW } else { IDC_IBEAM };
+            unsafe {
+                let _ = SetCursor(LoadCursorW(None, shape).ok());
+            }
+            return LRESULT(1);
+        }
         WM_SETFOCUS | WM_KILLFOCUS => {
             window.focused = msg == WM_SETFOCUS;
             window.reset_blink();
@@ -458,6 +757,11 @@ pub fn run_message_loop() {
         for hwnd in windows {
             let Some(cell) = state(hwnd) else { continue };
             let mut window = cell.borrow_mut();
+            // A WM_APP_OUTPUT that arrived while the window was busy (in a modal
+            // dialog, say) went to DefWindowProc; the flag still says output waits.
+            if window.output_pending.load(Ordering::Acquire) {
+                window.output_arrived();
+            }
             if !window.dirty {
                 continue;
             }

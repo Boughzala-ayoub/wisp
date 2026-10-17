@@ -11,14 +11,17 @@ use std::rc::Rc;
 use std::sync::mpsc::{self, Receiver};
 use std::thread;
 
+use libghostty_vt::fmt::Format;
 use libghostty_vt::render::{CellIterator, RenderState, RowIterator};
+use libghostty_vt::selection::FormatOptions;
 use libghostty_vt::style::RgbColor;
 use libghostty_vt::terminal::{
-    ConformanceLevel, DeviceAttributeFeature, DeviceAttributes, DeviceType, Options, PrimaryDeviceAttributes,
-    SecondaryDeviceAttributes, SizeReportSize,
+    ConformanceLevel, DeviceAttributeFeature, DeviceAttributes, DeviceType, Mode, Options, PrimaryDeviceAttributes,
+    ScrollViewport, SecondaryDeviceAttributes, SizeReportSize,
 };
-use libghostty_vt::{Terminal, focus};
+use libghostty_vt::{Terminal, focus, paste};
 
+use crate::mouse::Mouse;
 use crate::pty::Pty;
 
 /// Ghostty's default colors, so Wisp looks the same out of the box.
@@ -32,6 +35,7 @@ pub struct Pane {
     pub render_state: RenderState<'static>,
     pub row_iter: RowIterator<'static>,
     pub cell_iter: CellIterator<'static>,
+    pub mouse: Mouse,
     pty: Pty,
     output: Receiver<Vec<u8>>,
     /// conhost asked for keys in win32-input-mode (`ESC[?9001h`).
@@ -108,6 +112,14 @@ impl Pane {
             .on_title_changed({
                 let flag = title_changed.clone();
                 move |_| flag.set(true)
+            })?
+            // OSC 52: programs (including ones inside ssh) can set the clipboard,
+            // which Ghostty allows by default. Reading it back is never allowed.
+            .on_clipboard_write(|_, write| {
+                if let Some(text) = write.contents().find(|c| c.mime.starts_with("text/")) {
+                    crate::clipboard::set_text(None, text.data);
+                }
+                Ok(())
             })?;
 
         Ok(Pane {
@@ -115,6 +127,7 @@ impl Pane {
             render_state: RenderState::new()?,
             row_iter: RowIterator::new()?,
             cell_iter: CellIterator::new()?,
+            mouse: Mouse::new()?,
             pty,
             output: rx,
             win32_input: false,
@@ -128,6 +141,9 @@ impl Pane {
     pub fn pump(&mut self) -> bool {
         let mut any = false;
         while let Ok(chunk) = self.output.try_recv() {
+            if trace_pty() {
+                eprintln!("pty> {}", chunk.escape_ascii());
+            }
             // ponytail: misses the mode switch if a read splits the sequence; conhost
             // sends it in its first write, so that hasn't happened yet.
             if contains(&chunk, b"\x1b[?9001h") {
@@ -151,6 +167,9 @@ impl Pane {
     }
 
     pub fn write(&self, data: &[u8]) {
+        if trace_pty() && !data.is_empty() {
+            eprintln!("pty< {}", data.escape_ascii());
+        }
         // A failed write means the child is gone; its exit is reported separately.
         let _ = self.pty.write(data);
     }
@@ -166,9 +185,36 @@ impl Pane {
         let _ = self.pty.resize(size.columns, size.rows);
     }
 
+    /// The selected text as plain text, the way Ghostty copies it: soft-wrapped
+    /// lines rejoined and trailing spaces trimmed.
+    pub fn selection_text(&self) -> Option<String> {
+        let options = FormatOptions::new().with_emit_format(Format::Plain).with_unwrap(true).with_trim(true);
+        let bytes = self.terminal.format_selection_alloc(None, options).ok()??;
+        Some(String::from_utf8_lossy(&bytes).into_owned())
+    }
+
+    pub fn clear_selection(&self) {
+        let _ = self.terminal.set_selection(None);
+    }
+
+    /// Whether pasting `text` could run commands before the user sees it: it
+    /// has a line break and the program isn't using bracketed paste.
+    pub fn paste_needs_confirmation(&self, text: &str) -> bool {
+        !self.terminal.mode(Mode::BRACKETED_PASTE).unwrap_or(false) && !paste::is_safe(text)
+    }
+
+    pub fn paste(&self, text: &str) {
+        let bracketed = self.terminal.mode(Mode::BRACKETED_PASTE).unwrap_or(false);
+        self.write(&encode_paste(text, bracketed));
+    }
+
+    pub fn scroll(&mut self, scroll: ScrollViewport) {
+        self.terminal.scroll_viewport(scroll);
+    }
+
     /// Reports focus changes to the program if it asked for them (mode 1004).
     pub fn focus_changed(&self, focused: bool) {
-        if !self.terminal.mode(libghostty_vt::terminal::Mode::FOCUS_EVENT).unwrap_or(false) {
+        if !self.terminal.mode(Mode::FOCUS_EVENT).unwrap_or(false) {
             return;
         }
         let event = if focused { focus::Event::Gained } else { focus::Event::Lost };
@@ -177,6 +223,24 @@ impl Pane {
             self.write(&buf[..n]);
         }
     }
+}
+
+/// Prepares pasted text for the pty: control characters neutralized, line
+/// breaks sent as Enter, and bracketed paste markers added when asked for.
+fn encode_paste(text: &str, bracketed: bool) -> Vec<u8> {
+    // Windows text uses CRLF; one Enter per line, not two.
+    let mut data = text.replace("\r\n", "\n").into_bytes();
+    // The markers add 12 bytes; nothing else grows.
+    let mut out = vec![0u8; data.len() + 12];
+    let n = paste::encode(&mut data, bracketed, &mut out).unwrap_or(0);
+    out.truncate(n);
+    out
+}
+
+/// `WISP_TRACE_PTY=1` logs everything that crosses the pty to stderr.
+fn trace_pty() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("WISP_TRACE_PTY").is_some())
 }
 
 fn contains(haystack: &[u8], needle: &[u8]) -> bool {
@@ -230,5 +294,73 @@ mod tests {
 
         pane.resize(SizeReportSize { rows: 10, columns: 40, ..size });
         assert_eq!((pane.terminal.cols().unwrap(), pane.terminal.rows().unwrap()), (40, 10));
+    }
+
+    #[test]
+    fn pastes_send_one_enter_per_line_and_respect_bracketed_mode() {
+        assert_eq!(encode_paste("dir\r\nls\n", false), b"dir\rls\r");
+        assert_eq!(encode_paste("a\x1bb", false), b"a b", "escape sequences can't be smuggled in");
+        assert_eq!(encode_paste("x\ny", true), b"\x1b[200~x\ny\x1b[201~");
+    }
+
+    fn pane_with(text: &[u8]) -> Pane {
+        let size = SizeReportSize { rows: 5, columns: 20, cell_width: 9, cell_height: 19 };
+        let mut pane = Pane::spawn("cmd.exe /c exit", size, || {}, || {}).unwrap();
+        pane.terminal.vt_write(b"\x1b[H\x1b[2J");
+        pane.terminal.vt_write(text);
+        pane
+    }
+
+    const LAYOUT: crate::mouse::Layout =
+        crate::mouse::Layout { width: 180, height: 95, cell_width: 9, cell_height: 19, padding: 0 };
+
+    #[test]
+    fn selection_copies_unwrapped_trimmed_text() {
+        use crate::mouse::Button;
+        use libghostty_vt::key::Mods;
+        // 25 characters wrap onto a second row of a 20-column terminal.
+        let mut pane = pane_with(b"abcdefghijklmnopqrstuvwxy\r\nsecond line   ");
+        let Pane { mouse, terminal, .. } = &mut pane;
+        let mut out = Vec::new();
+        // Drag from the first cell to the middle of the third row.
+        mouse.press(terminal, Button::Left, 1.0, 5.0, Mods::empty(), LAYOUT, &mut out).unwrap();
+        mouse.moved(terminal, 9.0 * 15.5, 19.0 * 2.5, Mods::empty(), LAYOUT, &mut out).unwrap();
+        mouse.release(terminal, Button::Left, 9.0 * 15.5, 19.0 * 2.5, Mods::empty(), LAYOUT, &mut out).unwrap();
+        assert!(out.is_empty(), "nothing is reported to a program that doesn't track the mouse");
+        assert_eq!(pane.selection_text().as_deref(), Some("abcdefghijklmnopqrstuvwxy\nsecond line"));
+        pane.clear_selection();
+        assert_eq!(pane.selection_text(), None);
+    }
+
+    #[test]
+    fn double_click_selects_a_word() {
+        use crate::mouse::Button;
+        use libghostty_vt::key::Mods;
+        let mut pane = pane_with(b"echo hello-world done");
+        let Pane { mouse, terminal, .. } = &mut pane;
+        let mut out = Vec::new();
+        let x = 9.0 * 7.5; // inside "hello-world"
+        for _ in 0..2 {
+            mouse.press(terminal, Button::Left, x, 5.0, Mods::empty(), LAYOUT, &mut out).unwrap();
+            mouse.release(terminal, Button::Left, x, 5.0, Mods::empty(), LAYOUT, &mut out).unwrap();
+        }
+        assert_eq!(pane.selection_text().as_deref(), Some("hello-world"));
+    }
+
+    #[test]
+    fn programs_that_track_the_mouse_get_reports() {
+        use crate::mouse::Button;
+        use libghostty_vt::key::Mods;
+        // The program asks for button tracking with SGR encoding.
+        let mut pane = pane_with(b"\x1b[?1000h\x1b[?1006h");
+        let Pane { mouse, terminal, .. } = &mut pane;
+        let mut out = Vec::new();
+        mouse.press(terminal, Button::Left, 9.0 * 2.5, 19.0 * 1.5, Mods::empty(), LAYOUT, &mut out).unwrap();
+        assert_eq!(out, b"\x1b[<0;3;2M", "left press at column 3, row 2");
+        out.clear();
+        // Shift bypasses tracking and selects instead.
+        mouse.press(terminal, Button::Left, 9.0 * 2.5, 19.0 * 1.5, Mods::SHIFT, LAYOUT, &mut out).unwrap();
+        assert!(out.is_empty());
+        assert!(mouse.is_selecting());
     }
 }

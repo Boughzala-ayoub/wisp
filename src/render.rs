@@ -32,6 +32,9 @@ use crate::sprite;
 use crate::term::Pane;
 
 const ATLAS_SIZE: u32 = 2048;
+/// Enhanced-contrast strength for dark and for light text, calibrated against
+/// Direct2D by the `text_weight_matches_direct2d` test.
+const TEXT_CONTRAST: [f32; 2] = [0.0, 0.3];
 /// Glyph cache key face for characters drawn by [`sprite`] rather than a font.
 const SPRITE_FACE: FaceId = FaceId::MAX;
 
@@ -44,7 +47,10 @@ const DOTTED: u32 = 4;
 const DASHED: u32 = 5;
 
 const SHADER: &str = r#"
-cbuffer Globals : register(b0) { float2 pixel_to_clip; };
+cbuffer Globals : register(b0) {
+    float2 pixel_to_clip;
+    float2 contrast; // enhanced-contrast strength for dark and for light text
+};
 Texture2D<float> coverage_atlas : register(t0);
 Texture2D<float4> color_atlas : register(t1);
 
@@ -82,7 +88,7 @@ Pixel vs_main(Quad q, uint id : SV_VertexID) {
 // counters that with an "enhanced contrast" curve; we scale its strength with
 // the text's brightness.
 float enhance_contrast(float coverage, float3 color) {
-    float k = lerp(0.2, 1.4, dot(color, float3(0.2126, 0.7152, 0.0722)));
+    float k = lerp(contrast.x, contrast.y, dot(color, float3(0.2126, 0.7152, 0.0722)));
     return coverage * (k + 1) / (coverage * k + 1);
 }
 
@@ -242,6 +248,8 @@ pub struct Renderer {
     /// `None` marks glyphs with no ink (spaces) so they aren't rasterized again.
     glyphs: HashMap<(FaceId, u16), Option<Slot>>,
     atlas_full: bool,
+    /// Enhanced-contrast strength for dark and for light text; see the shader.
+    pub text_contrast: [f32; 2],
     quads: Vec<Quad>,
     quad_buffer: Option<(ID3D11Buffer, usize)>,
     // Scratch buffers reused across rows and frames.
@@ -345,6 +353,7 @@ impl Renderer {
                 raster: raster.unwrap(),
                 globals: globals.unwrap(),
                 glyphs: HashMap::new(),
+                text_contrast: TEXT_CONTRAST,
                 atlas_full: false,
                 quads: Vec::new(),
                 quad_buffer: None,
@@ -646,7 +655,8 @@ impl Renderer {
             std::ptr::copy_nonoverlapping(self.quads.as_ptr(), mapped.pData.cast(), count);
             ctx.Unmap(buffer, 0);
 
-            let globals = [2.0 / width as f32, 2.0 / height as f32, 0.0, 0.0];
+            let [low, high] = self.text_contrast;
+            let globals = [2.0 / width as f32, 2.0 / height as f32, low, high];
             ctx.UpdateSubresource(&self.globals, 0, None, globals.as_ptr().cast(), 0, 0);
 
             ctx.OMSetRenderTargets(Some(&[Some(target.clone())]), None);
@@ -667,6 +677,7 @@ impl Renderer {
             ctx.VSSetShader(&self.vertex_shader, None);
             ctx.VSSetConstantBuffers(0, Some(&[Some(self.globals.clone())]));
             ctx.PSSetShader(&self.pixel_shader, None);
+            ctx.PSSetConstantBuffers(0, Some(&[Some(self.globals.clone())]));
             ctx.PSSetShaderResources(
                 0,
                 Some(&[Some(self.coverage_atlas.view.clone()), Some(self.color_atlas.view.clone())]),
@@ -873,6 +884,134 @@ pub mod tests {
         }
         let per_frame = start.elapsed() / frames;
         eprintln!("120x40 frame build: {per_frame:?}");
+    }
+
+    /// Ink mass (summed brightness above the background) and the share of
+    /// partially covered pixels, for comparing how heavy text looks.
+    fn weight(pixels: &[[u8; 4]], background: u8) -> (u64, f32) {
+        let ink: Vec<u8> = pixels.iter().map(|p| p[1].saturating_sub(background)).filter(|&v| v > 8).collect();
+        let total = ink.iter().map(|&v| v as u64).sum();
+        let span = 255 - background as u32;
+        let edges = ink.iter().filter(|&&v| (v as u32) > span / 5 && (v as u32) < span * 4 / 5).count();
+        (total, edges as f32 / ink.len().max(1) as f32)
+    }
+
+    /// Draws `text` white on the default background with Direct2D, which
+    /// applies DirectWrite's own gamma and contrast: the Windows reference.
+    fn render_direct2d(text: &str, font: &Font, width: u32, height: u32) -> Vec<[u8; 4]> {
+        use windows::Win32::Graphics::Direct2D::Common::{
+            D2D_RECT_F, D2D1_ALPHA_MODE_PREMULTIPLIED, D2D1_COLOR_F, D2D1_PIXEL_FORMAT,
+        };
+        use windows::Win32::Graphics::Direct2D::*;
+        use windows::Win32::Graphics::DirectWrite::*;
+        use windows::Win32::Graphics::Dxgi::IDXGISurface;
+        let mut renderer = Renderer::with_driver(D3D_DRIVER_TYPE_WARP).unwrap();
+        unsafe {
+            let desc = D3D11_TEXTURE2D_DESC {
+                Width: width,
+                Height: height,
+                MipLevels: 1,
+                ArraySize: 1,
+                Format: DXGI_FORMAT_B8G8R8A8_UNORM,
+                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                Usage: D3D11_USAGE_DEFAULT,
+                BindFlags: D3D11_BIND_RENDER_TARGET.0 as u32,
+                ..Default::default()
+            };
+            let mut texture = None;
+            renderer.device.CreateTexture2D(&desc, None, Some(&mut texture)).unwrap();
+            let texture = texture.unwrap();
+            let factory: ID2D1Factory = D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, None).unwrap();
+            let props = D2D1_RENDER_TARGET_PROPERTIES {
+                pixelFormat: D2D1_PIXEL_FORMAT {
+                    format: DXGI_FORMAT_B8G8R8A8_UNORM,
+                    alphaMode: D2D1_ALPHA_MODE_PREMULTIPLIED,
+                },
+                dpiX: 96.0,
+                dpiY: 96.0,
+                ..Default::default()
+            };
+            let target =
+                factory.CreateDxgiSurfaceRenderTarget(&texture.cast::<IDXGISurface>().unwrap(), &props).unwrap();
+            target.SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
+            let dwrite: IDWriteFactory = DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED).unwrap();
+            let format = dwrite
+                .CreateTextFormat(
+                    windows::core::w!("Cascadia Code"),
+                    None,
+                    DWRITE_FONT_WEIGHT_NORMAL,
+                    DWRITE_FONT_STYLE_NORMAL,
+                    DWRITE_FONT_STRETCH_NORMAL,
+                    font.em_px,
+                    windows::core::w!("en-us"),
+                )
+                .unwrap();
+            let white = target.CreateSolidColorBrush(&D2D1_COLOR_F { r: 1.0, g: 1.0, b: 1.0, a: 1.0 }, None).unwrap();
+            let bg = rgba(crate::term::DEFAULT_BACKGROUND, 1.0);
+            let text: Vec<u16> = text.encode_utf16().collect();
+            target.BeginDraw();
+            target.Clear(Some(&D2D1_COLOR_F { r: bg[0], g: bg[1], b: bg[2], a: 1.0 }));
+            let rect = D2D_RECT_F { left: 0.0, top: 0.0, right: width as f32, bottom: height as f32 };
+            target.DrawText(&text, &format, &rect, &white, D2D1_DRAW_TEXT_OPTIONS_NONE, DWRITE_MEASURING_MODE_NATURAL);
+            target.EndDraw(None, None).unwrap();
+
+            // Read back through the same staging path the other tests use.
+            let staging_desc = D3D11_TEXTURE2D_DESC {
+                Usage: D3D11_USAGE_STAGING,
+                BindFlags: 0,
+                CPUAccessFlags: D3D11_CPU_ACCESS_READ.0 as u32,
+                ..desc
+            };
+            let mut staging = None;
+            renderer.device.CreateTexture2D(&staging_desc, None, Some(&mut staging)).unwrap();
+            let staging = staging.unwrap();
+            renderer.context.CopyResource(&staging, &texture);
+            let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
+            renderer.context.Map(&staging, 0, D3D11_MAP_READ, 0, Some(&mut mapped)).unwrap();
+            let mut pixels = Vec::new();
+            for row in 0..height {
+                let line = mapped.pData.cast::<u8>().add((row * mapped.RowPitch) as usize);
+                pixels.extend((0..width).map(|col| {
+                    let p = line.add(col as usize * 4);
+                    [*p, *p.add(1), *p.add(2), *p.add(3)]
+                }));
+            }
+            renderer.context.Unmap(&staging, 0);
+            let _ = &mut renderer;
+            pixels
+        }
+    }
+
+    /// White text should look as heavy as Windows draws it. Direct2D applies
+    /// DirectWrite's own gamma and contrast, so it is the reference. Run with
+    /// `--nocapture` to see how other contrast strengths compare.
+    #[test]
+    fn text_weight_matches_direct2d() {
+        let text = "line 52 of the scrollback test: Wisp renders text";
+        let columns = text.len() as u16 + 2;
+        let font = Font::new("Cascadia Code", 12.0, 96).unwrap();
+        let (width, height) = (font.cell_width * columns as u32, font.cell_height);
+        let background = crate::term::DEFAULT_BACKGROUND.g;
+        let reference = weight(&render_direct2d(text, &font, width, height), background);
+        eprintln!("Direct2D:      ink {:>6}  edges {:.2}", reference.0, reference.1);
+        let ours_with = |high: f32| {
+            let mut renderer = Renderer::with_driver(D3D_DRIVER_TYPE_WARP).unwrap();
+            renderer.text_contrast = [TEXT_CONTRAST[0], high];
+            let mut font = Font::new("Cascadia Code", 12.0, 96).unwrap();
+            let size = SizeReportSize { rows: 1, columns, cell_width: font.cell_width, cell_height: font.cell_height };
+            let mut pane = Pane::spawn("cmd.exe /c exit", size, || {}, || {}).unwrap();
+            pane.terminal.vt_write(b"\x1b[H\x1b[2J\x1b[?25l");
+            pane.terminal.vt_write(text.as_bytes());
+            let frame = renderer.draw_pane(&mut pane, &mut font, (0.0, 0.0), true, true).unwrap();
+            weight(&render_offscreen(&mut renderer, width, height, frame.background), background)
+        };
+        for high in [0.0, 0.25, 0.5, 1.0] {
+            let (ink, edges) = ours_with(high);
+            eprintln!("contrast {high:<4}: ink {ink:>6}  edges {edges:.2}");
+        }
+        let (ink, _) = ours_with(TEXT_CONTRAST[1]);
+        let ratio = ink as f64 / reference.0 as f64;
+        assert!((0.95..=1.05).contains(&ratio), "text is {:.0}% of Direct2D's weight", ratio * 100.0);
     }
 
     #[test]

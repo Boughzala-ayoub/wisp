@@ -1,8 +1,10 @@
 //! Wisp: a fast Windows terminal built on libghostty-vt, Ghostty's terminal core.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod clipboard;
 mod font;
 mod input;
+mod mouse;
 mod pty;
 mod render;
 mod sprite;
