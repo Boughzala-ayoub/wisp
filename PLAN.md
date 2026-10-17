@@ -46,6 +46,18 @@ All binding types are `!Send + !Sync`. The terminal lives on one thread.
 
 WispTerm (wispterm.com) is an MIT terminal built on libghostty-vt with a D3D11 renderer. "Wisp" is close enough to cause confusion. That doesn't matter for a local project, but pick a different name before publishing anything.
 
+Three candidates, checked on 2026-10-17. None is a crate on crates.io, none appears in a GitHub repo about terminals, and a web search found no software with the name:
+
+| Name | What it is | GitHub repos using the name | Catches |
+|---|---|---|---|
+| **Fanlight** | The half-round window over a door, letting light into a hall | 21, the biggest a Unity project | A GitHub user `fanlight` exists with no repos |
+| **Fogwell** | Made up: fog, and a well of it. Close to a wisp in spirit | 0 | A GitHub user `Fogwell` exists with no repos |
+| **Clerestory** | The row of high windows that lights a church nave | 15, none of them terminals | Hard to spell and say; the npm name is taken |
+
+Ruled out along the way: every short word tried (shoji, sumi, mote, plume, lumen, glint, kiln, tern, washi, skylight and others) is already a crate. Lightwell has 135 repos. Glasswing is Anthropic's Project Glasswing. Lucarne is an existing tool for Claude Code and Codex sessions, too close to this project's audience.
+
+I'd pick Fanlight. It's a real word, it says "window" without borrowing Microsoft's trademark, and nothing in this space uses it.
+
 ## Decision
 
 **Build on libghostty-vt and write the renderer, PTY layer and UI ourselves.** This is the path upstream recommends and tests, and it is how WispTerm got to a working D3D11 terminal without a fork. The cost is that we write font rendering and a config parser. The config format is small, and native DirectWrite text is what I'd want on Windows anyway.
@@ -141,8 +153,9 @@ IME preedit (showing text while composing) and Kitty graphics come after MVP.
 - Bundled `conpty.dll`/`OpenConsole.exe` are MIT (microsoft/terminal).
 - A `THIRD-PARTY-NOTICES.md` lists every dependency we link or ship. I'm borrowing ideas from the ports above, not code. If that changes, the copied file keeps its copyright line and gets a notice entry.
 
-## Open questions
+## Decisions after review
 
-1. Keep the name "Wisp" given WispTerm, or rename now?
-2. Windows 11 only, or should Windows 10 work too (no Mica, solid background)?
-3. Cascadia Code as the default font, or bundle JetBrains Mono (OFL) the way Ghostty does?
+1. "Wisp" stays the working name, and the project gets renamed before anything is published. The candidates are under [Name clash](#name-clash).
+2. Windows 11 is the target. Without Mica or acrylic the window falls back to a solid background.
+3. Cascadia Code is the default font.
+4. Wisp is a free, MIT-licensed showcase project, not a product.

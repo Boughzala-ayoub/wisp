@@ -11,14 +11,17 @@ in Ghostty on a Mac: fast, sharp text, nothing in the way.
 
 ## Status
 
-Early. Milestones 1 to 6 of 7 are done: PowerShell runs through ConPTY, text renders with
-ligatures, color emoji, font fallback and seamless box drawing, the mouse selects, scrolls and
-reaches programs that track it, a Ghostty-format config with themes and keybinds applies live, and
-the window has tabs in its title bar, Ghostty-style splits, acrylic or Mica, and fullscreen. A menu
-opens PowerShell, Command Prompt, Git Bash or any WSL distribution, running on Microsoft's newer
-ConPTY when it's bundled. See
-[PLAN.md](PLAN.md) for the milestones and [DEVLOG.md](DEVLOG.md) for progress with measured
-numbers.
+Early, but all seven milestones of the first plan are done. PowerShell runs through ConPTY, text
+renders with ligatures, color emoji, font fallback and seamless box drawing, the mouse selects,
+scrolls and reaches programs that track it, a Ghostty-format config with themes and keybinds
+applies live, and the window has tabs in its title bar, Ghostty-style splits, acrylic or Mica, and
+fullscreen. A menu opens PowerShell, Command Prompt, Git Bash or any WSL distribution, running on
+Microsoft's newer ConPTY when it's bundled.
+
+On a mid-range laptop Wisp shows its first frame 110 ms after launch, turns a keypress into a
+finished frame in under a millisecond at the median, and streams `cat` output from WSL at 23 MB/s.
+[DEVLOG.md](DEVLOG.md) has the numbers per milestone and how each was measured. [PLAN.md](PLAN.md)
+has the research and the milestones.
 
 ## How it works
 
@@ -38,12 +41,13 @@ state. Wisp adds everything around it in Rust:
 - `mouse.rs` turns clicks into selections with libghostty-vt's gesture state machine, or into
   mouse reports for programs that ask for them. `clipboard.rs` talks to the Windows clipboard.
 - `config.rs` and `bindings.rs` read Ghostty-format config files, themes and keybinds.
-
-Set `WISP_TRACE_PTY=1` to log everything that crosses the pseudoconsole to stderr, and
-`WISP_TRACE_STARTUP=1` to time each stage of startup. `WISP_INBOX_CONPTY=1` uses the conhost built
-into Windows even when the bundled one is there.
 - `window.rs` owns the Win32 window, its tabs and splits, and paces frames to the display with a
   waitable swap chain. `chrome.rs` lays out the title bar and `layout.rs` the split tree.
+
+Set `WISP_TRACE_PTY=1` to log everything that crosses the pseudoconsole to stderr,
+`WISP_TRACE_STARTUP=1` to time each stage of startup, and `WISP_TRACE_LATENCY=1` to time each
+keypress until the frame showing its echo is presented. `WISP_INBOX_CONPTY=1` uses the conhost built into Windows
+even when the bundled one is there.
 
 ## Configuration
 
@@ -78,10 +82,14 @@ Alt+Enter toggle fullscreen, and Shift+Home/End are left to PSReadLine.
 You need Windows 11, Rust (MSVC toolchain), the Visual Studio Build Tools and git.
 
 ```powershell
-. .\scripts\bootstrap.ps1   # fetches Zig 0.15.2 and the pinned Ghostty source into .tools\
+. .\scripts\bootstrap.ps1   # fetches Zig 0.15.2, the pinned Ghostty source and ConPTY into .tools\
 cargo run --release
 cargo test
+.\scripts\package.ps1      # dist\wisp-<version>-x64.zip, with ConPTY and the license files
 ```
+
+`scripts\startup.ps1`, `latency.ps1` and `throughput.ps1` rerun the measurements in the devlog.
+They post input to Wisp's own window, so they don't need focus.
 
 ## Credits
 

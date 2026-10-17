@@ -367,6 +367,27 @@ mod tests {
         assert_eq!((pane.terminal.cols().unwrap(), pane.terminal.rows().unwrap()), (40, 10));
     }
 
+    /// How fast libghostty-vt parses plain output, with no pipe or conhost in
+    /// the way: `cargo test --release parse_throughput -- --ignored --nocapture`
+    #[test]
+    #[ignore = "benchmark"]
+    fn parse_throughput() {
+        let size = SizeReportSize { rows: 30, columns: 100, cell_width: 9, cell_height: 19 };
+        let mut pane = Pane::spawn("cmd.exe /c exit", None, size, &Config::default(), || {}, || {}).unwrap();
+        // The lines of `seq 1 12000000`, ending in CRLF the way ConPTY sends them.
+        let mut data = Vec::with_capacity(100 << 20);
+        for n in 1..=12_000_000u32 {
+            data.extend_from_slice(n.to_string().as_bytes());
+            data.extend_from_slice(b"\r\n");
+        }
+        let start = Instant::now();
+        for chunk in data.chunks(64 * 1024) {
+            pane.terminal.vt_write(chunk);
+        }
+        let (seconds, mb) = (start.elapsed().as_secs_f64(), data.len() as f64 / (1 << 20) as f64);
+        eprintln!("parsed {mb:.1} MB in {seconds:.2} s: {:.0} MB/s", mb / seconds);
+    }
+
     #[test]
     fn osc7_urls_become_windows_paths() {
         assert_eq!(file_url_path("file://host/C:/Users/me%20too"), "C:\\Users\\me too");

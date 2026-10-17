@@ -7,6 +7,40 @@ use std::{env, fs};
 fn main() {
     embed_themes();
     copy_conpty();
+    compile_shaders();
+}
+
+/// Compiles the HLSL with the Windows SDK's fxc.exe so startup doesn't have to.
+/// Without the SDK, the renderer compiles them at runtime instead.
+fn compile_shaders() {
+    println!("cargo:rerun-if-changed=src/shader.hlsl");
+    println!("cargo::rustc-check-cfg=cfg(precompiled_shaders)");
+    let Some(fxc) = find_fxc() else {
+        println!("cargo:warning=fxc.exe not found; shaders will compile at startup");
+        return;
+    };
+    let out = PathBuf::from(env::var("OUT_DIR").unwrap());
+    for (entry, profile) in [("vs_main", "vs_4_0"), ("ps_main", "ps_4_0")] {
+        let status = std::process::Command::new(&fxc)
+            .args(["/nologo", "/O3", "/T", profile, "/E", entry, "/Fo"])
+            .arg(out.join(format!("{entry}.cso")))
+            .arg("src/shader.hlsl")
+            .status();
+        if !status.is_ok_and(|s| s.success()) {
+            println!("cargo:warning=fxc couldn't compile {entry}; shaders will compile at startup");
+            return;
+        }
+    }
+    println!("cargo:rustc-cfg=precompiled_shaders");
+}
+
+/// The newest fxc.exe under the Windows SDK's bin folder.
+fn find_fxc() -> Option<PathBuf> {
+    let program_files = env::var_os("ProgramFiles(x86)")?;
+    let bin = Path::new(&program_files).join("Windows Kits").join("10").join("bin");
+    let mut versions: Vec<PathBuf> = fs::read_dir(bin).ok()?.filter_map(|e| e.ok().map(|e| e.path())).collect();
+    versions.sort();
+    versions.into_iter().rev().map(|v| v.join("x64").join("fxc.exe")).find(|fxc| fxc.is_file())
 }
 
 fn embed_themes() {

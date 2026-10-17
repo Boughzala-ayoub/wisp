@@ -50,73 +50,13 @@ const CURLY: u32 = 3;
 const DOTTED: u32 = 4;
 const DASHED: u32 = 5;
 
-const SHADER: &str = r#"
-cbuffer Globals : register(b0) {
-    float2 pixel_to_clip;
-    float2 contrast; // enhanced-contrast strength for dark and for light text
-};
-Texture2D<float> coverage_atlas : register(t0);
-Texture2D<float4> color_atlas : register(t1);
-
-struct Quad {
-    float4 rect : RECT;          // x, y, width, height in pixels
-    float2 uv : UV;              // top-left texel in the atlas (glyphs)
-    float4 color : COLOR;        // straight alpha
-    uint kind : KIND;
-    float param : PARAM;         // pattern period (underlines)
-};
-struct Pixel {
-    float4 pos : SV_Position;
-    float2 uv : UV;
-    nointerpolation float4 color : COLOR;
-    nointerpolation float4 rect : RECT;
-    nointerpolation uint kind : KIND;
-    nointerpolation float param : PARAM;
-};
-
-Pixel vs_main(Quad q, uint id : SV_VertexID) {
-    float2 corner = float2(id & 1, id >> 1);
-    float2 p = q.rect.xy + corner * q.rect.zw;
-    Pixel o;
-    o.pos = float4(p.x * pixel_to_clip.x - 1, 1 - p.y * pixel_to_clip.y, 0, 1);
-    o.uv = q.uv + corner * q.rect.zw;
-    o.color = q.color;
-    o.rect = q.rect;
-    o.kind = q.kind;
-    o.param = q.param;
-    return o;
-}
-
-// Coverage is blended in gamma space, which makes light text on a dark
-// background look thinner than the same text dark on light. DirectWrite
-// counters that with an "enhanced contrast" curve; we scale its strength with
-// the text's brightness.
-float enhance_contrast(float coverage, float3 color) {
-    float k = lerp(contrast.x, contrast.y, dot(color, float3(0.2126, 0.7152, 0.0722)));
-    return coverage * (k + 1) / (coverage * k + 1);
-}
-
-float4 ps_main(Pixel p) : SV_Target {
-    float a = p.color.a;
-    if (p.kind == 1) {
-        a *= enhance_contrast(coverage_atlas.Load(int3(p.uv, 0)), p.color.rgb);
-    } else if (p.kind == 2) {
-        return color_atlas.Load(int3(p.uv, 0)) * a;
-    } else if (p.kind == 3) {
-        // A sine wave through the middle of the band, phased by absolute x so
-        // it continues smoothly from one cell to the next.
-        float thickness = max(1, p.rect.w / 3);
-        float amplitude = (p.rect.w - thickness) / 2;
-        float center = p.rect.y + p.rect.w / 2 + amplitude * sin(p.pos.x * 6.2831853 / p.param);
-        a *= saturate(thickness / 2 + 0.5 - abs(p.pos.y - center));
-    } else if (p.kind == 4) {
-        a *= fmod(floor(p.pos.x), 2 * p.param) < p.param ? 1 : 0;
-    } else if (p.kind == 5) {
-        a *= fmod(floor(p.pos.x), p.param) < p.param * 0.6 ? 1 : 0;
-    }
-    return float4(p.color.rgb * a, a); // premultiplied
-}
-"#;
+/// The quad shaders. build.rs compiles them with the Windows SDK's fxc.exe
+/// when it can, which takes shader compilation off startup's critical path.
+const SHADER: &str = include_str!("shader.hlsl");
+#[cfg(precompiled_shaders)]
+const VERTEX_SHADER: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/vs_main.cso"));
+#[cfg(precompiled_shaders)]
+const PIXEL_SHADER: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/ps_main.cso"));
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -310,12 +250,11 @@ impl Renderer {
             let device: ID3D11Device = device.unwrap();
             crate::startup_mark("Direct3D device created");
 
-            let vs_code = compile(s!("vs_main"), s!("vs_4_0"))?;
-            let ps_code = compile(s!("ps_main"), s!("ps_4_0"))?;
+            let (vs_code, ps_code) = shader_bytecode()?;
             let mut vertex_shader = None;
-            device.CreateVertexShader(blob_bytes(&vs_code), None, Some(&mut vertex_shader))?;
+            device.CreateVertexShader(&vs_code, None, Some(&mut vertex_shader))?;
             let mut pixel_shader = None;
-            device.CreatePixelShader(blob_bytes(&ps_code), None, Some(&mut pixel_shader))?;
+            device.CreatePixelShader(&ps_code, None, Some(&mut pixel_shader))?;
 
             let element = |name: PCSTR, format: DXGI_FORMAT, offset: u32| D3D11_INPUT_ELEMENT_DESC {
                 SemanticName: name,
@@ -334,7 +273,7 @@ impl Renderer {
                 element(s!("PARAM"), DXGI_FORMAT_R32_FLOAT, 44),
             ];
             let mut layout = None;
-            device.CreateInputLayout(&elements, blob_bytes(&vs_code), Some(&mut layout))?;
+            device.CreateInputLayout(&elements, &vs_code, Some(&mut layout))?;
 
             let mut blend_desc = D3D11_BLEND_DESC::default();
             blend_desc.RenderTarget[0] = D3D11_RENDER_TARGET_BLEND_DESC {
@@ -931,6 +870,20 @@ fn rgba(c: RgbColor, alpha: f32) -> [f32; 4] {
     [c.r as f32 / 255.0, c.g as f32 / 255.0, c.b as f32 / 255.0, alpha]
 }
 
+/// The vertex and pixel shader bytecode: built ahead of time when build.rs
+/// found fxc.exe, compiled now otherwise.
+fn shader_bytecode() -> Result<(Vec<u8>, Vec<u8>)> {
+    #[cfg(precompiled_shaders)]
+    return Ok((VERTEX_SHADER.to_vec(), PIXEL_SHADER.to_vec()));
+    #[cfg(not(precompiled_shaders))]
+    {
+        let vs = compile(s!("vs_main"), s!("vs_4_0"))?;
+        let ps = compile(s!("ps_main"), s!("ps_4_0"))?;
+        Ok((blob_bytes(&vs).to_vec(), blob_bytes(&ps).to_vec()))
+    }
+}
+
+#[cfg_attr(precompiled_shaders, allow(dead_code))]
 fn compile(entry: PCSTR, target: PCSTR) -> Result<ID3DBlob> {
     let mut code = None;
     let mut errors = None;

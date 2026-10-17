@@ -95,8 +95,15 @@ SOFTWARE.
 
 ## Rust crates
 
-- libghostty-vt and libghostty-vt-sys, https://github.com/uzaaft/libghostty-rs, MIT OR Apache-2.0
-- windows, https://github.com/microsoft/windows-rs, MIT OR Apache-2.0
+These crates are compiled into `wisp.exe`. Each is offered under MIT OR Apache-2.0, and Wisp uses
+them under the MIT License, whose text is the same as Ghostty's above with the copyright lines below.
 
-The full dependency tree is in `Cargo.lock`. A complete notice file with every
-license text gets generated before the first release.
+| Crate | Version | Copyright |
+|---|---|---|
+| [libghostty-vt, libghostty-vt-sys](https://github.com/uzaaft/libghostty-rs) | 0.2.2 | Copyright (c) 2026 Uzair Aftab, Leah Amelia Chen |
+| [windows, windows-core, windows-link, windows-result, windows-strings, windows-numerics, windows-collections, windows-future, windows-threading](https://github.com/microsoft/windows-rs) | 0.62 | Copyright (c) Microsoft Corporation. |
+| [bitflags](https://github.com/bitflags/bitflags) | 2.13.2 | Copyright (c) 2014 The Rust Project Developers |
+
+Build-time only, not part of the binary: `int-enum`, `syn`, `quote`, `proc-macro2`,
+`proc-macro2-diagnostics`, `unicode-ident`, `version_check`, `windows-implement` and
+`windows-interface`. Exact versions are in `Cargo.lock`.

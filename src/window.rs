@@ -14,6 +14,7 @@
 use std::cell::RefCell;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Instant;
 
 use libghostty_vt::key::Mods;
 use libghostty_vt::selection::gesture::Autoscroll;
@@ -62,6 +63,14 @@ const WM_APP_OUTPUT: u32 = WM_APP + 1;
 const WM_APP_EXITED: u32 = WM_APP + 2;
 /// Shows config errors once the window is up, so startup isn't blocked on a dialog.
 const WM_APP_CONFIG_ERRORS: u32 = WM_APP + 3;
+/// Opens the new-tab menu. Menus and dialogs run their own message loop, so
+/// they open from `window_proc` with our state released: the panes keep
+/// receiving output and drawing behind them.
+const WM_APP_SHELL_MENU: u32 = WM_APP + 4;
+/// Asks about the paste stashed in `Window::pending_paste`, the same way.
+const WM_APP_CONFIRM_PASTE: u32 = WM_APP + 5;
+/// The new-tab menu's command for opening the config file.
+const MENU_OPEN_CONFIG: usize = 1000;
 const BLINK_TIMER: usize = 1;
 /// Ghostty's cursor blink interval.
 const BLINK_MS: u32 = 600;
@@ -160,6 +169,11 @@ pub struct Window {
     window_title: String,
     /// The focused cursor's position in client pixels, where IME windows go.
     ime_spot: Option<(i32, i32)>,
+    /// With `WISP_TRACE_LATENCY=1`: when the last keypress went out, and when
+    /// its echo came back, until the frame showing it is presented.
+    latency: Option<(Instant, Option<Instant>)>,
+    /// A paste waiting on the user's confirmation, and the pane it's for.
+    pending_paste: Option<(PaneId, String)>,
 }
 
 impl Window {
@@ -281,6 +295,8 @@ impl Window {
                 fullscreen: None,
                 window_title: String::new(),
                 ime_spot: None,
+                latency: None,
+                pending_paste: None,
             };
             crate::startup_mark("UI fonts loaded");
             window.relayout();
@@ -510,6 +526,11 @@ impl Window {
         let (w, h) = (self.surface.width, self.surface.height);
         self.renderer.render(&target, w, h, self.config.background, self.config.background_opacity)?;
         self.surface.present()?;
+        if let Some((pressed, Some(echoed))) = self.latency {
+            let ms = |t: Instant| t.duration_since(pressed).as_secs_f64() * 1000.0;
+            eprintln!("latency key->echo {:.2} ms  key->present {:.2} ms", ms(echoed), ms(Instant::now()));
+            self.latency = None;
+        }
         self.run_blink_timer(blinks);
         if ime_spot.is_some() && ime_spot != self.ime_spot {
             self.ime_spot = ime_spot;
@@ -624,30 +645,24 @@ impl Window {
         pretty_title(&self.pane_titles[id], &self.pane_names[id])
     }
 
-    /// Lists the installed shells under the chevron; the chosen one opens in a new tab.
-    fn shell_menu(&mut self) {
-        const OPEN_CONFIG: usize = 1000;
-        let shells = shells::detect();
+    /// Where the new-tab menu opens, in screen coordinates: under the chevron.
+    fn menu_anchor(&self) -> POINT {
         let (bar, _) = self.title_bar();
+        let mut at = POINT { x: bar.menu.x, y: bar.menu.y + bar.menu.height };
         unsafe {
-            let Ok(menu) = CreatePopupMenu() else { return };
-            for (i, shell) in shells.iter().enumerate() {
-                let _ = AppendMenuW(menu, MF_STRING, i + 1, &HSTRING::from(&shell.name));
-            }
-            let _ = AppendMenuW(menu, MF_SEPARATOR, 0, None);
-            let _ = AppendMenuW(menu, MF_STRING, OPEN_CONFIG, w!("Settings (config file)\tCtrl+,"));
-            let mut at = POINT { x: bar.menu.x, y: bar.menu.y + bar.menu.height };
             let _ = ClientToScreen(self.hwnd, &mut at);
-            let flags = TPM_RETURNCMD | TPM_LEFTALIGN | TPM_TOPALIGN;
-            let chosen = TrackPopupMenu(menu, flags, at.x, at.y, None, self.hwnd, None);
-            let _ = DestroyMenu(menu);
-            match chosen.0 as usize {
-                0 => {}
-                OPEN_CONFIG => open_config(self.hwnd),
-                n => {
-                    if let Err(e) = self.new_tab(shells.get(n - 1).cloned()) {
-                        eprintln!("opening a tab failed: {e}");
-                    }
+        }
+        at
+    }
+
+    /// Acts on the new-tab menu's command (see `show_shell_menu`).
+    fn shell_chosen(&mut self, command: usize, shells: &[Shell]) {
+        match command {
+            0 => {}
+            MENU_OPEN_CONFIG => open_config(self.hwnd),
+            n => {
+                if let Err(e) = self.new_tab(shells.get(n - 1).cloned()) {
+                    eprintln!("opening a tab failed: {e}");
                 }
             }
         }
@@ -760,10 +775,16 @@ impl Window {
     fn output_arrived(&mut self) {
         self.output_pending.store(false, Ordering::Release);
         let visible: Vec<PaneId> = self.visible_panes().iter().map(|&(id, _)| id).collect();
+        let focused = self.tabs.get(self.active).map(|t| t.focused);
         for (id, slot) in self.panes.iter_mut().enumerate() {
             let Some(pane) = slot else { continue };
             if pane.pump() && visible.contains(&id) {
                 self.dirty = true;
+                if Some(id) == focused
+                    && let Some((_, echoed @ None)) = &mut self.latency
+                {
+                    *echoed = Some(Instant::now());
+                }
             }
             if let Some(title) = pane.take_title() {
                 self.pane_titles[id] = title;
@@ -838,6 +859,9 @@ impl Window {
         }
         if out.is_empty() {
             out = event.encode();
+        }
+        if down && trace_latency() && !is_modifier(VIRTUAL_KEY(vk)) {
+            self.latency = Some((Instant::now(), None));
         }
         self.pane(id).write(out.as_bytes());
         true
@@ -1039,14 +1063,23 @@ impl Window {
     fn paste_clipboard(&mut self) -> bool {
         let Some(text) = clipboard::get_text(Some(self.hwnd)).filter(|t| !t.is_empty()) else { return false };
         let id = self.focused_id();
-        let risky = self.config.clipboard_paste_protection && self.pane(id).paste_needs_confirmation(&text);
-        if risky && !confirm_paste(self.hwnd, &text) {
+        if self.config.clipboard_paste_protection && self.pane(id).paste_needs_confirmation(&text) {
+            self.pending_paste = Some((id, text));
+            unsafe {
+                let _ = PostMessageW(Some(self.hwnd), WM_APP_CONFIRM_PASTE, WPARAM(0), LPARAM(0));
+            }
             return true;
         }
-        let pane = self.pane_mut(id);
-        pane.scroll(ScrollViewport::Bottom);
-        pane.paste(&text);
+        self.paste_into(id, &text);
         true
+    }
+
+    /// Pastes into a pane, unless it closed in the meantime.
+    fn paste_into(&mut self, id: PaneId, text: &str) {
+        if let Some(pane) = self.panes.get_mut(id).and_then(Option::as_mut) {
+            pane.scroll(ScrollViewport::Bottom);
+            pane.paste(text);
+        }
     }
 
     /// A pane's rect and the layout its mouse coordinates are relative to.
@@ -1178,7 +1211,9 @@ impl Window {
                     eprintln!("opening a tab failed: {e}");
                 }
             }
-            (Button::Left, Hit::NewTabMenu) => self.shell_menu(),
+            (Button::Left, Hit::NewTabMenu) => unsafe {
+                let _ = PostMessageW(Some(self.hwnd), WM_APP_SHELL_MENU, WPARAM(0), LPARAM(0));
+            },
             _ => {}
         }
         self.dirty = true;
@@ -1414,6 +1449,13 @@ fn start_pane(
     Pane::spawn(command, cwd.as_deref(), size, config, wake, exited)
 }
 
+/// `WISP_TRACE_LATENCY=1` logs, per keypress, how long until the echo arrives
+/// and until the frame showing it is presented.
+fn trace_latency() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("WISP_TRACE_LATENCY").is_some())
+}
+
 /// Removes the WM_CHAR messages TranslateMessage queued for the key being handled.
 fn take_typed_chars(hwnd: HWND) -> Vec<u16> {
     let mut chars = Vec::new();
@@ -1429,6 +1471,23 @@ fn take_typed_chars(hwnd: HWND) -> Vec<u16> {
         }
     }
     chars
+}
+
+/// Lists the installed shells, then a Settings entry, and returns the chosen
+/// command: a shell's index plus one, `MENU_OPEN_CONFIG`, or 0 if dismissed.
+fn show_shell_menu(hwnd: HWND, shells: &[Shell], at: POINT) -> usize {
+    unsafe {
+        let Ok(menu) = CreatePopupMenu() else { return 0 };
+        for (i, shell) in shells.iter().enumerate() {
+            let _ = AppendMenuW(menu, MF_STRING, i + 1, &HSTRING::from(&shell.name));
+        }
+        let _ = AppendMenuW(menu, MF_SEPARATOR, 0, None);
+        let _ = AppendMenuW(menu, MF_STRING, MENU_OPEN_CONFIG, w!("Settings (config file)\tCtrl+,"));
+        let flags = TPM_RETURNCMD | TPM_LEFTALIGN | TPM_TOPALIGN;
+        let chosen = TrackPopupMenu(menu, flags, at.x, at.y, None, hwnd, None);
+        let _ = DestroyMenu(menu);
+        chosen.0 as usize
+    }
 }
 
 /// Asks before pasting text that would run commands as it arrives. This is
@@ -1637,7 +1696,32 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpar
     let Ok(mut window) = cell.try_borrow_mut() else { return default() };
     match msg {
         WM_APP_OUTPUT => window.output_arrived(),
-        WM_APP_CONFIG_ERRORS => show_config_errors(hwnd, &window.config),
+        // Menus and dialogs run with our state released (see WM_APP_SHELL_MENU).
+        // The window may close while one is open, so look it up again after.
+        WM_APP_CONFIG_ERRORS => {
+            let config = window.config.clone();
+            drop(window);
+            show_config_errors(hwnd, &config);
+        }
+        WM_APP_SHELL_MENU => {
+            let at = window.menu_anchor();
+            drop(window);
+            let shells = shells::detect();
+            let command = show_shell_menu(hwnd, &shells, at);
+            if let Some(mut window) = state(hwnd).and_then(|cell| cell.try_borrow_mut().ok()) {
+                window.shell_chosen(command, &shells);
+            }
+        }
+        WM_APP_CONFIRM_PASTE => {
+            if let Some((id, text)) = window.pending_paste.take() {
+                drop(window);
+                if confirm_paste(hwnd, &text)
+                    && let Some(mut window) = state(hwnd).and_then(|cell| cell.try_borrow_mut().ok())
+                {
+                    window.paste_into(id, &text);
+                }
+            }
+        }
         WM_APP_EXITED => {
             if window.close_pane(wparam.0) {
                 drop(window);
@@ -1648,7 +1732,9 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpar
         }
         WM_CLOSE => {
             let panes = window.pane_count();
-            if window.config.confirm_close_surface && panes > 1 {
+            let confirm = window.config.confirm_close_surface;
+            drop(window); // the dialog's message loop needs our state free
+            if confirm && panes > 1 {
                 let message = format!("Close this window and the {panes} shells running in it?");
                 let answer = unsafe {
                     MessageBoxW(Some(hwnd), &HSTRING::from(message), w!("Wisp"), MB_OKCANCEL | MB_ICONQUESTION)
@@ -1657,7 +1743,6 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpar
                     return LRESULT(0);
                 }
             }
-            drop(window);
             return default();
         }
         WM_NCHITTEST => {

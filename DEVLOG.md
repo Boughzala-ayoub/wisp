@@ -223,3 +223,57 @@ Things that surprised me:
   cleared conhost, and a new test now draws icons before terminal text and compares the pixels.
 - **`wsl.exe` keeps quotes as part of the name.** `wsl -d "Ubuntu"` fails with "no distribution
   with the supplied name". WSL names can't contain spaces, so Wisp passes them bare.
+
+## M7: numbers, and a zip
+
+*2026-10-17*
+
+![Claude Code's full-screen UI running in Wisp, with a prompt typed but not sent](docs/devlog/m7-claude-code.png)
+
+This milestone measures what the first six built. Each number comes from a script in `scripts/`
+that posts input straight to Wisp's window, so a run needs no focus and never touches the
+clipboard. Wisp can also time itself: `WISP_TRACE_STARTUP=1` prints each startup stage and
+`WISP_TRACE_LATENCY=1` prints each keypress.
+
+| | |
+|---|---|
+| Launch to first frame | median 110 ms over 10 launches, range 100 to 129 ms (`startup.ps1`) |
+| Keypress to echo | median 0.4 ms in cmd, 0.6 ms in Windows PowerShell, p95 12 to 13 ms |
+| Keypress to present | median 0.8 ms in cmd, 0.9 ms in Windows PowerShell, p95 13 to 14 ms (`latency.ps1`, 100 keys each) |
+| `cat` of a 92 MB file in a WSL tab | 3.96 s, 23 MB/s (`throughput.ps1`) |
+| The same on the ConPTY built into Windows | 35.4 s, 2.6 MB/s |
+| libghostty-vt parsing that text with no pipe | 0.54 s, about 194 MB/s (`cargo test --release parse_throughput -- --ignored`) |
+| Memory, idle with one PowerShell tab | 80 MB working set |
+| Download | 1.5 MB zip holding a 2.5 MB `wisp.exe`, ConPTY and the license files (`package.ps1`) |
+| Tests | 58, plus 3 opt-in benchmarks |
+
+Startup dropped from 144 ms to 110 ms once the shaders were compiled at build time. `build.rs`
+finds `fxc` in the Windows SDK, and without it Wisp still compiles them at runtime. Most of what's
+left is Direct3D creating its device, 85 to 95 ms on this hybrid-GPU laptop. That already runs on a
+second thread while the shell starts. A single-threaded device made no difference.
+
+The latency numbers stop at the `Present` call. The compositor shows the frame at the next refresh,
+which adds up to 16.7 ms on this 60 Hz screen, and the panel adds its own delay after that. Timing
+the light leaving the screen takes a camera or a photodiode, and I have neither. So the claim is
+narrow: in the usual case Wisp turns a keypress into a finished frame in under a millisecond. I
+haven't traced the p95 tail yet. It happens before Wisp draws anything, so it comes from ConPTY
+batching its output or from how that output wakes the window.
+
+The pipe is the bottleneck for throughput, not the parser. libghostty-vt parses about eight times
+faster than the bundled conhost delivers, and the conhost inside Windows is nine times slower
+again. That one comparison justifies shipping Microsoft's ConPTY package next to the exe. The plan
+also called for the same run in Windows Terminal, and that's still to do. 80 MB idle is more than I
+expected for one tab, and I haven't looked at where it goes.
+
+Things that surprised me:
+
+- **Dialogs froze the terminal.** Wisp keeps each window's state in a `RefCell` and passes any
+  message that arrives while it's borrowed straight to Windows. A menu or message box runs its own
+  message loop inside the call that opened it, with the state still borrowed. So while the new-tab
+  menu, the paste warning or the config-error dialog was open, the shell's output stopped drawing.
+  I found it when a benchmark window stayed blank. A quoting mistake in my script passed stray
+  arguments, and the warning about them froze the window behind it. All three now open from the
+  window procedure after it lets go of the state. With the menu held open, a PowerShell clock kept
+  ticking behind it.
+- **Claude Code needed nothing special.** Its full-screen UI, the block-art mascot, the colored
+  status line and the ✳ in the tab title all came through ConPTY as they are.
