@@ -23,7 +23,16 @@ pub struct Layout {
     pub height: u32,
     pub cell_width: u32,
     pub cell_height: u32,
-    pub padding: u32,
+    pub padding: Padding,
+}
+
+/// Space between the window edges and the grid, in pixels.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Padding {
+    pub left: u32,
+    pub top: u32,
+    pub right: u32,
+    pub bottom: u32,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -265,10 +274,10 @@ impl Mouse {
                 screen_height: layout.height,
                 cell_width: layout.cell_width,
                 cell_height: layout.cell_height,
-                padding_top: layout.padding,
-                padding_bottom: layout.padding,
-                padding_left: layout.padding,
-                padding_right: layout.padding,
+                padding_top: layout.padding.top,
+                padding_bottom: layout.padding.bottom,
+                padding_left: layout.padding.left,
+                padding_right: layout.padding.right,
             })
             .set_any_button_pressed(self.reported != 0)
             // Only report motion when the pointer enters a new cell.
@@ -286,12 +295,12 @@ fn bit(button: Button) -> u8 {
 
 /// The viewport cell under a window position, clamped to the grid.
 fn viewport_cell(term: &Terminal, x: f32, y: f32, layout: Layout) -> Result<PointCoordinate, Error> {
-    let cell = |pos: f32, size: u32, count: u32| {
-        (((pos - layout.padding as f32) / size as f32).floor().max(0.0) as u32).min(count.saturating_sub(1))
+    let cell = |pos: f32, start: u32, size: u32, count: u32| {
+        (((pos - start as f32) / size as f32).floor().max(0.0) as u32).min(count.saturating_sub(1))
     };
     Ok(PointCoordinate {
-        x: cell(x, layout.cell_width, term.cols()? as u32) as u16,
-        y: cell(y, layout.cell_height, term.rows()? as u32),
+        x: cell(x, layout.padding.left, layout.cell_width, term.cols()? as u32) as u16,
+        y: cell(y, layout.padding.top, layout.cell_height, term.rows()? as u32),
     })
 }
 
@@ -299,7 +308,7 @@ fn geometry(term: &Terminal, layout: Layout) -> Result<Geometry, Error> {
     Ok(Geometry {
         columns: term.cols()? as u32,
         cell_width: layout.cell_width,
-        padding_left: layout.padding,
+        padding_left: layout.padding.left,
         screen_height: layout.height,
     })
 }

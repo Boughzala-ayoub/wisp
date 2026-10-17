@@ -14,21 +14,15 @@ use std::thread;
 use libghostty_vt::fmt::Format;
 use libghostty_vt::render::{CellIterator, RenderState, RowIterator};
 use libghostty_vt::selection::FormatOptions;
-use libghostty_vt::style::RgbColor;
 use libghostty_vt::terminal::{
-    ConformanceLevel, DeviceAttributeFeature, DeviceAttributes, DeviceType, Mode, Options, PrimaryDeviceAttributes,
-    ScrollViewport, SecondaryDeviceAttributes, SizeReportSize,
+    ConformanceLevel, CursorStyle, DeviceAttributeFeature, DeviceAttributes, DeviceType, Mode, Options,
+    PrimaryDeviceAttributes, ScrollViewport, SecondaryDeviceAttributes, SizeReportSize,
 };
 use libghostty_vt::{Terminal, focus, paste};
 
+use crate::config::{self, Config};
 use crate::mouse::Mouse;
 use crate::pty::Pty;
-
-/// Ghostty's default colors, so Wisp looks the same out of the box.
-pub const DEFAULT_BACKGROUND: RgbColor = RgbColor { r: 0x28, g: 0x2c, b: 0x34 };
-pub const DEFAULT_FOREGROUND: RgbColor = RgbColor { r: 0xff, g: 0xff, b: 0xff };
-
-const SCROLLBACK_LINES: usize = 10_000;
 
 pub struct Pane {
     pub terminal: Terminal<'static, 'static>,
@@ -42,6 +36,8 @@ pub struct Pane {
     pub win32_input: bool,
     size: Rc<Cell<SizeReportSize>>,
     title_changed: Rc<Cell<bool>>,
+    /// Programs may set the clipboard with OSC 52 (`clipboard-write`).
+    clipboard_write: Rc<Cell<bool>>,
 }
 
 impl Pane {
@@ -50,6 +46,7 @@ impl Pane {
     pub fn spawn(
         command_line: &str,
         size: SizeReportSize,
+        config: &Config,
         wake: impl Fn() + Send + 'static,
         exited: impl FnOnce() + Send + 'static,
     ) -> Result<Pane, Box<dyn std::error::Error>> {
@@ -68,17 +65,13 @@ impl Pane {
             }
         })?;
 
-        let mut terminal =
-            Terminal::new(Options { cols: size.columns, rows: size.rows, max_scrollback: SCROLLBACK_LINES })?;
+        let max_scrollback = config.scrollback_lines(size.columns);
+        let mut terminal = Terminal::new(Options { cols: size.columns, rows: size.rows, max_scrollback })?;
         terminal.resize(size.columns, size.rows, size.cell_width, size.cell_height)?;
-        terminal
-            .set_default_bg_color(Some(DEFAULT_BACKGROUND))?
-            .set_default_fg_color(Some(DEFAULT_FOREGROUND))?
-            // Ghostty blinks the cursor unless a program asks it not to.
-            .set_default_cursor_blink(Some(true))?;
 
         let size = Rc::new(Cell::new(size));
         let title_changed = Rc::new(Cell::new(false));
+        let clipboard_write = Rc::new(Cell::new(config.clipboard_write));
         let mut replies: File = pty.writer()?;
         // Replies to queries (cursor position, device attributes, modes). conhost
         // sends some of these at startup and holds output until they're answered.
@@ -115,14 +108,20 @@ impl Pane {
             })?
             // OSC 52: programs (including ones inside ssh) can set the clipboard,
             // which Ghostty allows by default. Reading it back is never allowed.
-            .on_clipboard_write(|_, write| {
-                if let Some(text) = write.contents().find(|c| c.mime.starts_with("text/")) {
-                    crate::clipboard::set_text(None, text.data);
+            .on_clipboard_write({
+                let allowed = clipboard_write.clone();
+                move |_, write| {
+                    if !allowed.get() {
+                        return Err(libghostty_vt::terminal::ClipboardWriteError::Denied);
+                    }
+                    if let Some(text) = write.contents().find(|c| c.mime.starts_with("text/")) {
+                        crate::clipboard::set_text(None, text.data);
+                    }
+                    Ok(())
                 }
-                Ok(())
             })?;
 
-        Ok(Pane {
+        let mut pane = Pane {
             terminal,
             render_state: RenderState::new()?,
             row_iter: RowIterator::new()?,
@@ -133,7 +132,34 @@ impl Pane {
             win32_input: false,
             size,
             title_changed,
-        })
+            clipboard_write,
+        };
+        pane.apply_config(config);
+        Ok(pane)
+    }
+
+    /// Applies the config's colors and cursor defaults. Programs can still
+    /// change them at runtime; these are what a reset returns to.
+    pub fn apply_config(&mut self, config: &Config) {
+        let t = &mut self.terminal;
+        let _ = t.set_default_bg_color(Some(config.background));
+        let _ = t.set_default_fg_color(Some(config.foreground));
+        let _ = t.set_default_cursor_color(config.cursor_color);
+        // Start from libghostty's own palette so a reload drops removed entries.
+        let _ = t.set_default_color_palette(None);
+        if let Ok(builtin) = t.default_color_palette() {
+            let _ = t.set_default_color_palette(Some(config.palette_over(builtin)));
+        }
+        let style = match config.cursor_style {
+            config::CursorStyle::Block => CursorStyle::Block,
+            config::CursorStyle::Bar => CursorStyle::Bar,
+            config::CursorStyle::Underline => CursorStyle::Underline,
+            config::CursorStyle::BlockHollow => CursorStyle::BlockHollow,
+        };
+        let _ = t.set_default_cursor_style(Some(style));
+        // Ghostty blinks the cursor unless the config or a program says otherwise.
+        let _ = t.set_default_cursor_blink(Some(config.cursor_style_blink.unwrap_or(true)));
+        self.clipboard_write.set(config.clipboard_write);
     }
 
     /// Feeds all output received so far into the terminal. Returns whether
@@ -270,6 +296,7 @@ mod tests {
         let mut pane = Pane::spawn(
             "cmd.exe /k echo wisp-%COLORTERM%",
             size,
+            &Config::default(),
             move || {
                 let _ = wake_tx.send(());
             },
@@ -305,14 +332,19 @@ mod tests {
 
     fn pane_with(text: &[u8]) -> Pane {
         let size = SizeReportSize { rows: 5, columns: 20, cell_width: 9, cell_height: 19 };
-        let mut pane = Pane::spawn("cmd.exe /c exit", size, || {}, || {}).unwrap();
+        let mut pane = Pane::spawn("cmd.exe /c exit", size, &crate::config::Config::default(), || {}, || {}).unwrap();
         pane.terminal.vt_write(b"\x1b[H\x1b[2J");
         pane.terminal.vt_write(text);
         pane
     }
 
-    const LAYOUT: crate::mouse::Layout =
-        crate::mouse::Layout { width: 180, height: 95, cell_width: 9, cell_height: 19, padding: 0 };
+    const LAYOUT: crate::mouse::Layout = crate::mouse::Layout {
+        width: 180,
+        height: 95,
+        cell_width: 9,
+        cell_height: 19,
+        padding: crate::mouse::Padding { left: 0, top: 0, right: 0, bottom: 0 },
+    };
 
     #[test]
     fn selection_copies_unwrapped_trimmed_text() {

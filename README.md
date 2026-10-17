@@ -11,10 +11,11 @@ in Ghostty on a Mac: fast, sharp text, nothing in the way.
 
 ## Status
 
-Early. Milestones 1 to 3 of 7 are done: PowerShell runs through ConPTY, text renders with
-ligatures, color emoji, font fallback and seamless box drawing, and the mouse selects, scrolls and
-reaches programs that track it. Right-click copies or pastes. See [PLAN.md](PLAN.md) for the
-milestones and [DEVLOG.md](DEVLOG.md) for progress with measured numbers.
+Early. Milestones 1 to 4 of 7 are done: PowerShell runs through ConPTY, text renders with
+ligatures, color emoji, font fallback and seamless box drawing, the mouse selects, scrolls and
+reaches programs that track it, and a Ghostty-format config with themes and keybinds applies
+live. See [PLAN.md](PLAN.md) for the milestones and [DEVLOG.md](DEVLOG.md) for progress with
+measured numbers.
 
 ## How it works
 
@@ -31,9 +32,38 @@ state. Wisp adds everything around it in Rust:
 - `render.rs` draws each frame as one instanced Direct3D 11 call.
 - `mouse.rs` turns clicks into selections with libghostty-vt's gesture state machine, or into
   mouse reports for programs that ask for them. `clipboard.rs` talks to the Windows clipboard.
+- `config.rs` and `bindings.rs` read Ghostty-format config files, themes and keybinds.
 
 Set `WISP_TRACE_PTY=1` to log everything that crosses the pseudoconsole to stderr.
 - `window.rs` owns the Win32 window and paces frames to the display with a waitable swap chain.
+
+## Configuration
+
+Wisp reads Ghostty's config format, so an existing Ghostty config mostly just works. The file lives at
+`%LOCALAPPDATA%\wisp\config.ghostty` (or under `%XDG_CONFIG_HOME%` if that's set). Ctrl+, opens it in
+an editor and Ctrl+Shift+, reloads it without restarting the shell.
+
+```
+font-family = Cascadia Code
+# Tried for characters the first font lacks:
+font-family = Symbols Nerd Font Mono
+font-size = 13
+# Ligatures off:
+font-feature = -calt
+theme = light:Catppuccin Latte,dark:Catppuccin Mocha
+cursor-style = bar
+window-padding-x = 8
+# Ctrl+C copies when something is selected, interrupts otherwise:
+keybind = performable:ctrl+c=copy_to_clipboard
+```
+
+All 771 themes Ghostty ships are built in, and a `light:...,dark:...` theme follows Windows' dark
+mode setting as it changes. Keys Wisp doesn't support yet are logged and skipped, not reported as
+errors, since most come from a macOS or Linux config. Any key also works as a flag:
+`wisp --theme=Dracula`.
+
+Defaults follow Ghostty, with a few Windows conventions: right-click copies or pastes, F11 and
+Alt+Enter toggle fullscreen, and Shift+Home/End are left to PSReadLine.
 
 ## Building
 

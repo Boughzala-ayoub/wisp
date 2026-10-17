@@ -116,3 +116,38 @@ Things that surprised me:
   couldn't be restored exactly, so copy and paste ran only through unit tests and one opt-in test
   that overwrites the clipboard. Selection, wheel scrolling and mouse reports were checked in the
   real window.
+
+## M4: Ghostty config and themes
+
+*2026-10-17*
+
+![Wisp with the Catppuccin Mocha theme, a bar cursor and wider padding](docs/devlog/m4-catppuccin.png)
+
+Wisp reads Ghostty's config format from `%LOCALAPPDATA%\wisp\config.ghostty`: repeatable keys,
+`key =` to reset, `config-file` includes (optional ones with `?`, relative paths, cycles caught),
+and every key doubles as a command-line flag. Ctrl+, opens the file and Ctrl+Shift+, applies it to
+the running window: colors, fonts, padding and keybinds change without restarting the shell.
+
+All 771 themes Ghostty ships are built into the exe, 366 KB of text. A theme applies before the
+config, so colors in the config override it. `theme = light:A,dark:B` follows Windows' dark mode
+setting and switches when it changes. Keybinds use Ghostty's syntax and action names, including
+`performable:`, and the defaults are Ghostty's Linux set with a few Windows changes.
+
+| | |
+|---|---|
+| Bundled themes | 771, each parsed by a test with no errors and no ignored keys |
+| Live reload | font, size, theme and padding applied on Ctrl+Shift+, in the running window |
+| Tests | 43, plus 2 opt-in |
+
+Things that surprised me:
+
+- **A keyboard layout decides what a binding means.** This machine uses a French layout, where the
+  digit row types `&é"'(` and digits need Shift. Ghostty's `alt+1` would never fire if triggers
+  matched typed characters. Digits and named keys therefore match the physical key, and
+  punctuation like `ctrl+comma` matches whichever key types a comma, the same split Ghostty makes.
+- **Most of a Mac config is not an error.** A Ghostty config written on macOS is full of
+  `macos-*` keys. Treating unknown keys as errors would greet every Mac user with a dialog, so
+  only bad values and missing files show one. Unsupported keys go to the log.
+- **Ghostty's inline comments aren't comments.** Only a `#` at the start of a line starts one, so
+  `background = #282c34` works. I got my own README example wrong at first, writing a comment at
+  the end of a line, and the parser would have read it as part of the value.

@@ -72,7 +72,7 @@ mod tests {
     #[test]
     fn conhost_understands_our_keys() {
         let size = SizeReportSize { rows: 24, columns: 80, cell_width: 9, cell_height: 19 };
-        let mut pane = Pane::spawn("cmd.exe /k", size, || {}, || {}).unwrap();
+        let mut pane = Pane::spawn("cmd.exe /k", size, &crate::config::Config::default(), || {}, || {}).unwrap();
         let screen = |pane: &Pane| {
             use libghostty_vt::fmt::{Format, Formatter, FormatterOptions};
             let mut f = Formatter::new(&pane.terminal, FormatterOptions::new().with_format(Format::Plain)).unwrap();

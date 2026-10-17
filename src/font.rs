@@ -72,6 +72,8 @@ pub struct Font {
     collection: IDWriteFontCollection,
     family: HSTRING,
     faces: Vec<Face>,
+    /// OpenType features from `font-feature`, applied on top of the font's defaults.
+    features: Vec<DWRITE_FONT_FEATURE>,
     /// Shaped runs by style and text. Terminal text repeats a lot (prompts,
     /// borders, the same rows redrawn every frame) and shaping is the
     /// expensive part of a frame.
@@ -90,24 +92,49 @@ pub struct Font {
 }
 
 impl Font {
-    /// Loads `family` from the installed fonts, falling back to Consolas.
-    pub fn new(family: &str, size_pt: f32, dpi: u32) -> Result<Font> {
+    /// Uses the first installed family in `families` (Consolas if none is) and
+    /// tries the installed ones after it, in order, for characters it lacks,
+    /// before the system's own fallback. `features` are OpenType features like
+    /// `(*b"calt", 0)`.
+    pub fn new(families: &[String], size_pt: f32, dpi: u32, features: &[([u8; 4], u32)]) -> Result<Font> {
         unsafe {
             let factory: IDWriteFactory2 = DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED)?;
             let mut collection: Option<IDWriteFontCollection> = None;
             factory.GetSystemFontCollection(&mut collection, false)?;
             let collection = collection.expect("GetSystemFontCollection returned no collection");
 
-            let mut index = 0;
-            let mut exists = FALSE;
-            let mut family_name = HSTRING::new();
-            for name in [family, "Consolas"] {
-                family_name = HSTRING::from(name);
-                collection.FindFamilyName(&family_name, &mut index, &mut exists)?;
-                if exists.as_bool() {
-                    break;
+            let installed = |name: &str| -> Option<u32> {
+                let (mut index, mut exists) = (0, FALSE);
+                collection.FindFamilyName(&HSTRING::from(name), &mut index, &mut exists).ok()?;
+                exists.as_bool().then_some(index)
+            };
+            let mut available =
+                families.iter().map(String::as_str).chain(["Consolas"]).filter_map(|n| Some((n, installed(n)?)));
+            let (primary, index) = available.next().expect("Consolas ships with every Windows install");
+            let family_name = HSTRING::from(primary);
+            let extra: Vec<HSTRING> =
+                available.map(|(name, _)| HSTRING::from(name)).filter(|n| *n != family_name).collect();
+
+            // Configured fallback families first, then everything Windows would try.
+            let system_fallback = factory.GetSystemFontFallback()?;
+            let fallback = if extra.is_empty() {
+                system_fallback
+            } else {
+                let builder = factory.CreateFontFallbackBuilder()?;
+                let everything = [DWRITE_UNICODE_RANGE { first: 0, last: 0x10FFFF }];
+                for name in &extra {
+                    builder.AddMapping(
+                        &everything,
+                        &[name.as_ptr()],
+                        &collection,
+                        PCWSTR::null(),
+                        PCWSTR::null(),
+                        1.0,
+                    )?;
                 }
-            }
+                builder.AddMappings(&system_fallback)?;
+                builder.CreateFontFallback()?
+            };
             let family = collection.GetFontFamily(index)?;
             let mut faces = Vec::with_capacity(8);
             for face_id in 0..4 {
@@ -139,11 +166,18 @@ impl Font {
 
             Ok(Font {
                 analyzer: factory.CreateTextAnalyzer()?,
-                fallback: factory.GetSystemFontFallback()?,
+                fallback,
                 factory,
                 collection,
                 family: family_name,
                 faces,
+                features: features
+                    .iter()
+                    .map(|&(tag, value)| DWRITE_FONT_FEATURE {
+                        nameTag: DWRITE_FONT_FEATURE_TAG(u32::from_le_bytes(tag)),
+                        parameter: value,
+                    })
+                    .collect(),
                 shaped: HashMap::new(),
                 em_px,
                 cell_width: px(gm.advanceWidth as f32).round().max(1.0) as u32,
@@ -241,9 +275,21 @@ impl Font {
         let mut glyphs = vec![0u16; max_glyphs];
         let mut glyph_props = vec![DWRITE_SHAPING_GLYPH_PROPERTIES::default(); max_glyphs];
         let mut count = 0;
+        // The font's default features (ligatures and contextual alternates
+        // among them) always apply; configured ones are layered on top, over
+        // one range covering the whole run.
+        let typographic = DWRITE_TYPOGRAPHIC_FEATURES {
+            features: self.features.as_ptr().cast_mut(),
+            featureCount: self.features.len() as u32,
+        };
+        let typographic_ptr: *const DWRITE_TYPOGRAPHIC_FEATURES = &typographic;
+        let range_length = n as u32;
+        let (features, lengths, ranges) = if self.features.is_empty() {
+            (None, None, 0)
+        } else {
+            (Some(&raw const typographic_ptr), Some(&raw const range_length), 1)
+        };
         unsafe {
-            // `features: None` applies the font's default features, which
-            // include the ligatures and contextual alternates.
             self.analyzer.GetGlyphs(
                 PCWSTR(chars.as_ptr()),
                 n as u32,
@@ -253,9 +299,9 @@ impl Font {
                 &script,
                 LOCALE,
                 None,
-                None,
-                None,
-                0,
+                features,
+                lengths,
+                ranges,
                 max_glyphs as u32,
                 clusters.as_mut_ptr(),
                 text_props.as_mut_ptr(),
@@ -282,9 +328,9 @@ impl Font {
                 false,
                 &script,
                 LOCALE,
-                None,
-                None,
-                0,
+                features,
+                lengths,
+                ranges,
                 advances.as_mut_ptr(),
                 offsets.as_mut_ptr(),
             )?;
@@ -533,7 +579,7 @@ mod tests {
     }
 
     fn font() -> Font {
-        Font::new("Cascadia Code", 12.0, 96).unwrap()
+        Font::new(&["Cascadia Code".into()], 12.0, 96, &[]).unwrap()
     }
 
     #[test]
@@ -549,14 +595,14 @@ mod tests {
     #[test]
     fn metrics_scale_with_dpi() {
         let at_96 = font();
-        let at_144 = Font::new("Cascadia Code", 12.0, 144).unwrap();
+        let at_144 = Font::new(&["Cascadia Code".into()], 12.0, 144, &[]).unwrap();
         let ratio = at_144.cell_height as f32 / at_96.cell_height as f32;
         assert!((1.4..=1.6).contains(&ratio), "150% scaling changed cell height by {ratio}");
     }
 
     #[test]
     fn missing_family_falls_back() {
-        let font = Font::new("No Such Font 12345", 12.0, 96).unwrap();
+        let font = Font::new(&["No Such Font 12345".into()], 12.0, 96, &[]).unwrap();
         assert!(font.cell_width > 0);
     }
 
@@ -580,6 +626,34 @@ mod tests {
         font.shape(&utf16(">"), 0, &mut apart).unwrap();
         let ids = |g: &[ShapedGlyph]| g.iter().map(|g| g.glyph).collect::<Vec<_>>();
         assert_ne!(ids(&joined), ids(&apart));
+    }
+
+    #[test]
+    fn font_features_can_turn_ligatures_off() {
+        let ids = |features: &[([u8; 4], u32)]| {
+            let mut font = Font::new(&["Cascadia Code".into()], 12.0, 96, features).unwrap();
+            let mut glyphs = Vec::new();
+            font.shape(&utf16("=>"), 0, &mut glyphs).unwrap();
+            glyphs.iter().map(|g| g.glyph).collect::<Vec<_>>()
+        };
+        let mut plain = Font::new(&["Cascadia Code".into()], 12.0, 96, &[]).unwrap();
+        let mut apart = Vec::new();
+        plain.shape(&utf16("="), 0, &mut apart).unwrap();
+        plain.shape(&utf16(">"), 0, &mut apart).unwrap();
+        let apart: Vec<u16> = apart.iter().map(|g| g.glyph).collect();
+        assert_ne!(ids(&[]), apart, "ligatures on by default");
+        assert_eq!(ids(&[(*b"calt", 0)]), apart, "font-feature = -calt turns them off");
+    }
+
+    #[test]
+    fn configured_fallback_families_dont_hide_the_system_fallback() {
+        // Consolas comes before the system fallback but has no emoji, so the
+        // emoji must still come from Segoe UI Emoji and render in color.
+        let mut font = Font::new(&["Cascadia Code".into(), "Consolas".into()], 12.0, 96, &[]).unwrap();
+        let mut glyphs = Vec::new();
+        font.shape(&utf16("😀"), 0, &mut glyphs).unwrap();
+        let emoji = font.rasterize(glyphs[0].face, glyphs[0].glyph).unwrap().unwrap();
+        assert!(matches!(emoji.pixels, Pixels::Color(_)));
     }
 
     #[test]

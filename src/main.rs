@@ -1,7 +1,9 @@
 //! Wisp: a fast Windows terminal built on libghostty-vt, Ghostty's terminal core.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod bindings;
 mod clipboard;
+mod config;
 mod font;
 mod input;
 mod mouse;
@@ -19,9 +21,11 @@ use windows::Win32::UI::WindowsAndMessaging::{MB_ICONERROR, MessageBoxW};
 use windows::core::{HSTRING, w};
 
 fn main() {
+    let config = config::Config::load();
+    window::report(&config);
     let result = (|| {
         unsafe { SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2)? };
-        window::Window::open(&default_shell())
+        window::Window::open(config)
     })();
     if let Err(e) = result {
         unsafe { MessageBoxW(None, &HSTRING::from(format!("Wisp failed to start:\n\n{e}")), w!("Wisp"), MB_ICONERROR) };
@@ -39,14 +43,4 @@ pub fn ms_since_process_start() -> f64 {
     };
     let ticks = |t: FILETIME| (t.dwHighDateTime as u64) << 32 | t.dwLowDateTime as u64;
     ticks(now).saturating_sub(ticks(created)) as f64 / 10_000.0 // 100ns ticks
-}
-
-/// PowerShell 7 if it's installed, otherwise the Windows PowerShell every
-/// Windows install has.
-fn default_shell() -> String {
-    let on_path = |exe: &str| {
-        std::env::var_os("PATH").is_some_and(|path| std::env::split_paths(&path).any(|dir| dir.join(exe).is_file()))
-    };
-    let shell = if on_path("pwsh.exe") { "pwsh.exe" } else { "powershell.exe" };
-    format!("{shell} -NoLogo")
 }

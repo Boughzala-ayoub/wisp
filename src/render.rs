@@ -228,6 +228,24 @@ struct CellPaint {
 }
 
 /// What the window needs to know about the frame it just queued.
+/// Colors from the config that the terminal itself doesn't track.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Theme {
+    pub selection_background: Option<RgbColor>,
+    pub selection_foreground: Option<RgbColor>,
+    pub cursor_text: Option<RgbColor>,
+}
+
+impl Theme {
+    pub fn from_config(config: &crate::config::Config) -> Theme {
+        Theme {
+            selection_background: config.selection_background,
+            selection_foreground: config.selection_foreground,
+            cursor_text: config.cursor_text,
+        }
+    }
+}
+
 pub struct FrameInfo {
     pub background: RgbColor,
     /// The cursor is in a blinking mode, so the window should run the blink timer.
@@ -250,6 +268,7 @@ pub struct Renderer {
     atlas_full: bool,
     /// Enhanced-contrast strength for dark and for light text; see the shader.
     pub text_contrast: [f32; 2],
+    pub theme: Theme,
     quads: Vec<Quad>,
     quad_buffer: Option<(ID3D11Buffer, usize)>,
     // Scratch buffers reused across rows and frames.
@@ -354,6 +373,7 @@ impl Renderer {
                 globals: globals.unwrap(),
                 glyphs: HashMap::new(),
                 text_contrast: TEXT_CONTRAST,
+                theme: Theme::default(),
                 atlas_full: false,
                 quads: Vec::new(),
                 quad_buffer: None,
@@ -427,14 +447,21 @@ impl Renderer {
                 let style = if cell.has_styling()? { Some(cell.style()?) } else { None };
                 let mut fg = cell.fg_color()?.unwrap_or(colors.foreground);
                 let mut bg = cell.bg_color()?;
-                let inverse = style.is_some_and(|s| s.inverse);
-                if inverse != cell.is_selected()? {
+                if style.is_some_and(|s| s.inverse) {
                     (fg, bg) = (bg.unwrap_or(colors.background), Some(fg));
+                }
+                if cell.is_selected()? {
+                    // Configured selection colors, or the cell's colors swapped.
+                    let (sel_bg, sel_fg) = (self.theme.selection_background, self.theme.selection_foreground);
+                    let swapped_fg = bg.unwrap_or(colors.background);
+                    bg = Some(sel_bg.unwrap_or(fg));
+                    fg = sel_fg.unwrap_or(if sel_bg.is_some() { fg } else { swapped_fg });
                 }
                 let px = ox + col as f32 * cw;
                 if block_at == Some((col, y)) {
-                    // The cursor block replaces the background; its text shows in the background color.
-                    fg = colors.background;
+                    // The cursor block replaces the background; its text takes
+                    // `cursor-text`, or the background color.
+                    fg = self.theme.cursor_text.unwrap_or(colors.background);
                 } else if let Some(bg) = bg {
                     self.solid(px, py, cw * width as f32, ch, rgba(bg, 1.0));
                 }
@@ -847,10 +874,10 @@ pub mod tests {
     /// and the image width.
     fn render_vt(vt: &[u8], columns: u16, rows: u16) -> (Vec<[u8; 4]>, u32, Font) {
         let mut renderer = Renderer::with_driver(D3D_DRIVER_TYPE_WARP).unwrap();
-        let mut font = Font::new("Cascadia Code", 12.0, 96).unwrap();
+        let mut font = Font::new(&["Cascadia Code".into()], 12.0, 96, &[]).unwrap();
         let (cw, ch) = (font.cell_width, font.cell_height);
         let size = SizeReportSize { rows, columns, cell_width: cw, cell_height: ch };
-        let mut pane = Pane::spawn("cmd.exe /c exit", size, || {}, || {}).unwrap();
+        let mut pane = Pane::spawn("cmd.exe /c exit", size, &crate::config::Config::default(), || {}, || {}).unwrap();
         pane.terminal.vt_write(b"\x1b[H\x1b[2J\x1b[?25l");
         pane.terminal.vt_write(vt);
         let frame = renderer.draw_pane(&mut pane, &mut font, (0.0, 0.0), true, true).unwrap();
@@ -865,10 +892,10 @@ pub mod tests {
     #[ignore = "benchmark"]
     fn frame_build_time() {
         let mut renderer = Renderer::with_driver(D3D_DRIVER_TYPE_WARP).unwrap();
-        let mut font = Font::new("Cascadia Code", 12.0, 96).unwrap();
+        let mut font = Font::new(&["Cascadia Code".into()], 12.0, 96, &[]).unwrap();
         let size =
             SizeReportSize { rows: 40, columns: 120, cell_width: font.cell_width, cell_height: font.cell_height };
-        let mut pane = Pane::spawn("cmd.exe /c exit", size, || {}, || {}).unwrap();
+        let mut pane = Pane::spawn("cmd.exe /c exit", size, &crate::config::Config::default(), || {}, || {}).unwrap();
         let line =
             "fn main() { let x = a => b != c; println!(\"{x:?}\"); } // \x1b[1mbold\x1b[0m \x1b[32mgreen\x1b[0m ";
         for _ in 0..40 {
@@ -947,7 +974,7 @@ pub mod tests {
                 )
                 .unwrap();
             let white = target.CreateSolidColorBrush(&D2D1_COLOR_F { r: 1.0, g: 1.0, b: 1.0, a: 1.0 }, None).unwrap();
-            let bg = rgba(crate::term::DEFAULT_BACKGROUND, 1.0);
+            let bg = rgba(crate::config::Config::default().background, 1.0);
             let text: Vec<u16> = text.encode_utf16().collect();
             target.BeginDraw();
             target.Clear(Some(&D2D1_COLOR_F { r: bg[0], g: bg[1], b: bg[2], a: 1.0 }));
@@ -989,17 +1016,18 @@ pub mod tests {
     fn text_weight_matches_direct2d() {
         let text = "line 52 of the scrollback test: Wisp renders text";
         let columns = text.len() as u16 + 2;
-        let font = Font::new("Cascadia Code", 12.0, 96).unwrap();
+        let font = Font::new(&["Cascadia Code".into()], 12.0, 96, &[]).unwrap();
         let (width, height) = (font.cell_width * columns as u32, font.cell_height);
-        let background = crate::term::DEFAULT_BACKGROUND.g;
+        let background = crate::config::Config::default().background.g;
         let reference = weight(&render_direct2d(text, &font, width, height), background);
         eprintln!("Direct2D:      ink {:>6}  edges {:.2}", reference.0, reference.1);
         let ours_with = |high: f32| {
             let mut renderer = Renderer::with_driver(D3D_DRIVER_TYPE_WARP).unwrap();
             renderer.text_contrast = [TEXT_CONTRAST[0], high];
-            let mut font = Font::new("Cascadia Code", 12.0, 96).unwrap();
+            let mut font = Font::new(&["Cascadia Code".into()], 12.0, 96, &[]).unwrap();
             let size = SizeReportSize { rows: 1, columns, cell_width: font.cell_width, cell_height: font.cell_height };
-            let mut pane = Pane::spawn("cmd.exe /c exit", size, || {}, || {}).unwrap();
+            let mut pane =
+                Pane::spawn("cmd.exe /c exit", size, &crate::config::Config::default(), || {}, || {}).unwrap();
             pane.terminal.vt_write(b"\x1b[H\x1b[2J\x1b[?25l");
             pane.terminal.vt_write(text.as_bytes());
             let frame = renderer.draw_pane(&mut pane, &mut font, (0.0, 0.0), true, true).unwrap();

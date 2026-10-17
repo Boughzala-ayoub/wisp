@@ -21,22 +21,26 @@ use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::{INFINITE, WaitForSingleObject};
 use windows::Win32::UI::HiDpi::{AdjustWindowRectExForDpi, GetDpiForWindow};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    GetKeyState, ReleaseCapture, SetCapture, VIRTUAL_KEY, VK_A, VK_C, VK_CAPITAL, VK_CONTROL, VK_DOWN, VK_F4,
-    VK_INSERT, VK_LWIN, VK_MENU, VK_NEXT, VK_NUMLOCK, VK_PACKET, VK_PRIOR, VK_PROCESSKEY, VK_RWIN, VK_SHIFT, VK_UP,
-    VK_V,
+    GetKeyState, ReleaseCapture, SetCapture, VIRTUAL_KEY, VK_CAPITAL, VK_CONTROL, VK_DOWN, VK_F4, VK_LWIN, VK_MENU,
+    VK_NUMLOCK, VK_PACKET, VK_PROCESSKEY, VK_RWIN, VK_SHIFT, VK_UP,
 };
+use windows::Win32::UI::Shell::ShellExecuteW;
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::{BOOL, HSTRING, PCWSTR, w};
 
+use crate::bindings::Action;
 use crate::clipboard;
+use crate::config::{Config, RightClick};
 use crate::font::Font;
 use crate::input::{KeyEvent, control_key_state};
-use crate::mouse::{Button, Layout, Mouse, Wheel};
-use crate::render::{Renderer, Surface};
+use crate::mouse::{Button, Layout, Mouse, Padding, Wheel};
+use crate::render::{Renderer, Surface, Theme};
 use crate::term::Pane;
 
 const WM_APP_OUTPUT: u32 = WM_APP + 1;
 const WM_APP_EXITED: u32 = WM_APP + 2;
+/// Shows config errors once the window is up, so startup isn't blocked on a dialog.
+const WM_APP_CONFIG_ERRORS: u32 = WM_APP + 3;
 const BLINK_TIMER: usize = 1;
 /// Ghostty's cursor blink interval.
 const BLINK_MS: u32 = 600;
@@ -45,43 +49,9 @@ const AUTOSCROLL_TIMER: usize = 2;
 const AUTOSCROLL_MS: u32 = 40;
 const CLASS_NAME: PCWSTR = w!("WispWindow");
 
-const FONT_FAMILY: &str = "Cascadia Code";
-const FONT_SIZE_PT: f32 = 12.0;
-const PADDING_PT: f32 = 2.0;
-const INITIAL_COLUMNS: u16 = 100;
-const INITIAL_ROWS: u16 = 30;
-
 thread_local! {
     /// Every open window, so the message loop knows whose frames to pace.
     static WINDOWS: RefCell<Vec<HWND>> = const { RefCell::new(Vec::new()) };
-}
-
-/// What a key binding can do. These are Ghostty's action names, so they can
-/// map one to one onto `keybind` lines once bindings come from the config.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Action {
-    CopyToClipboard,
-    PasteFromClipboard,
-    SelectAll,
-    ScrollPageUp,
-    ScrollPageDown,
-}
-
-/// Ghostty's default bindings for Linux and Windows. Shift+Home and Shift+End
-/// (scroll to top and bottom in Ghostty) are left out on purpose: PSReadLine
-/// uses them to select text, and that matters more in PowerShell.
-fn default_binding(vk: VIRTUAL_KEY, mods: Mods) -> Option<Action> {
-    let ctrl_shift = Mods::CTRL | Mods::SHIFT;
-    match vk {
-        VK_C if mods == ctrl_shift => Some(Action::CopyToClipboard),
-        VK_V if mods == ctrl_shift => Some(Action::PasteFromClipboard),
-        VK_A if mods == ctrl_shift => Some(Action::SelectAll),
-        VK_INSERT if mods == Mods::CTRL => Some(Action::CopyToClipboard),
-        VK_INSERT if mods == Mods::SHIFT => Some(Action::PasteFromClipboard),
-        VK_PRIOR if mods == Mods::SHIFT => Some(Action::ScrollPageUp),
-        VK_NEXT if mods == Mods::SHIFT => Some(Action::ScrollPageDown),
-        _ => None,
-    }
 }
 
 /// The modifier keys held right now.
@@ -102,11 +72,16 @@ fn is_modifier(vk: VIRTUAL_KEY) -> bool {
 
 pub struct Window {
     hwnd: HWND,
+    config: Config,
     renderer: Renderer,
     surface: Surface,
     font: Font,
+    /// The current font size; Ctrl+= and friends move it away from the config's.
+    font_size: f32,
     pane: Pane,
     dpi: u32,
+    /// The mouse pointer is hidden until it moves (`mouse-hide-while-typing`).
+    pointer_hidden: bool,
     focused: bool,
     /// Blink phase: a blinking cursor shows while this is true.
     blink_on: bool,
@@ -125,8 +100,8 @@ pub struct Window {
 }
 
 impl Window {
-    /// Opens a window running `command_line` and shows it.
-    pub fn open(command_line: &str) -> std::result::Result<(), Box<dyn std::error::Error>> {
+    /// Opens a window running the configured shell and shows it.
+    pub fn open(config: Config) -> std::result::Result<(), Box<dyn std::error::Error>> {
         unsafe {
             let instance = GetModuleHandleW(None)?;
             let class = WNDCLASSEXW {
@@ -155,13 +130,13 @@ impl Window {
             )?;
 
             let dpi = GetDpiForWindow(hwnd);
-            let font = Font::new(FONT_FAMILY, FONT_SIZE_PT, dpi)?;
-            let padding = padding_px(dpi);
+            let font = Font::new(&config.font_families(), config.font_size, dpi, &config.font_features)?;
+            let padding = padding_px(&config, dpi);
             let mut rect = RECT {
                 left: 0,
                 top: 0,
-                right: (INITIAL_COLUMNS as u32 * font.cell_width + 2 * padding) as i32,
-                bottom: (INITIAL_ROWS as u32 * font.cell_height + 2 * padding) as i32,
+                right: (config.window_width as u32 * font.cell_width + padding.left + padding.right) as i32,
+                bottom: (config.window_height as u32 * font.cell_height + padding.top + padding.bottom) as i32,
             };
             AdjustWindowRectExForDpi(&mut rect, WS_OVERLAPPEDWINDOW, false, WS_EX_NOREDIRECTIONBITMAP, dpi)?;
             SetWindowPos(hwnd, None, 0, 0, rect.right - rect.left, rect.bottom - rect.top, SWP_NOMOVE | SWP_NOZORDER)?;
@@ -169,7 +144,8 @@ impl Window {
             let mut client = RECT::default();
             GetClientRect(hwnd, &mut client)?;
             let (width, height) = (client.right as u32, client.bottom as u32);
-            let renderer = Renderer::new()?;
+            let mut renderer = Renderer::new()?;
+            renderer.theme = Theme::from_config(&config);
             let surface = Surface::new(&renderer, hwnd, width, height)?;
             let size = grid_size(&font, padding, width, height);
 
@@ -184,16 +160,26 @@ impl Window {
             let exited = move || {
                 let _ = PostMessageW(Some(HWND(target as _)), WM_APP_EXITED, WPARAM(0), LPARAM(0));
             };
-            let pane = Pane::spawn(command_line, size, wake, exited)?;
+            let command_line = config.command.clone().unwrap_or_else(default_shell);
+            let pane = Pane::spawn(&command_line, size, &config, wake, exited)?;
 
-            style_title_bar(hwnd);
+            style_title_bar(hwnd, &config);
+            if let Some(title) = &config.title {
+                let _ = SetWindowTextW(hwnd, &HSTRING::from(title));
+            }
+            if !config.errors.is_empty() {
+                let _ = PostMessageW(Some(hwnd), WM_APP_CONFIG_ERRORS, WPARAM(0), LPARAM(0));
+            }
             let window = Window {
                 hwnd,
+                font_size: config.font_size,
+                config,
                 renderer,
                 surface,
                 font,
                 pane,
                 dpi,
+                pointer_hidden: false,
                 // WM_SETFOCUS sets this once the window is actually activated.
                 focused: false,
                 blink_on: true,
@@ -225,9 +211,9 @@ impl Window {
 
     fn try_render(&mut self) -> std::result::Result<(), Box<dyn std::error::Error>> {
         let target = self.surface.target(&self.renderer)?;
-        let padding = padding_px(self.dpi) as f32;
-        let frame =
-            self.renderer.draw_pane(&mut self.pane, &mut self.font, (padding, padding), self.focused, self.blink_on)?;
+        let padding = padding_px(&self.config, self.dpi);
+        let origin = (padding.left as f32, padding.top as f32);
+        let frame = self.renderer.draw_pane(&mut self.pane, &mut self.font, origin, self.focused, self.blink_on)?;
         self.renderer.render(&target, self.surface.width, self.surface.height, frame.background)?;
         self.surface.present()?;
         self.run_blink_timer(frame.cursor_blinks && self.focused);
@@ -265,18 +251,59 @@ impl Window {
         if let Err(e) = self.surface.resize(width, height) {
             eprintln!("resize failed: {e}");
         }
-        self.pane.resize(grid_size(&self.font, padding_px(self.dpi), width, height));
+        self.pane.resize(grid_size(&self.font, padding_px(&self.config, self.dpi), width, height));
         self.dirty = true;
     }
 
     fn dpi_changed(&mut self, dpi: u32) {
         self.dpi = dpi;
-        match Font::new(FONT_FAMILY, FONT_SIZE_PT, dpi) {
+        self.rebuild_font();
+        // The new size arrives with the WM_SIZE that follows.
+    }
+
+    /// Reloads the font at the current size and DPI and refits the grid.
+    fn rebuild_font(&mut self) {
+        match Font::new(&self.config.font_families(), self.font_size, self.dpi, &self.config.font_features) {
             Ok(font) => self.font = font,
-            Err(e) => eprintln!("reloading font for {dpi} DPI failed: {e}"),
+            Err(e) => eprintln!("loading the font failed: {e}"),
         }
         self.renderer.clear_glyphs();
-        // The new size arrives with the WM_SIZE that follows.
+        let (w, h) = (self.surface.width, self.surface.height);
+        self.pane.resize(grid_size(&self.font, padding_px(&self.config, self.dpi), w, h));
+        self.dirty = true;
+    }
+
+    /// Reads the config again and applies everything that can change live.
+    /// The shell keeps running; `command` only affects new windows.
+    fn reload_config(&mut self) {
+        let config = Config::load();
+        report(&config);
+        let font_changed = config.font_families() != self.config.font_families()
+            || config.font_size != self.config.font_size
+            || config.font_features != self.config.font_features;
+        if config.font_size != self.config.font_size {
+            self.font_size = config.font_size;
+        }
+        self.pane.apply_config(&config);
+        self.renderer.theme = Theme::from_config(&config);
+        style_title_bar(self.hwnd, &config);
+        if let Some(title) = &config.title {
+            unsafe {
+                let _ = SetWindowTextW(self.hwnd, &HSTRING::from(title));
+            }
+        }
+        let errors = !config.errors.is_empty();
+        self.config = config;
+        if font_changed {
+            self.rebuild_font();
+        } else {
+            let (w, h) = (self.surface.width, self.surface.height);
+            self.resize(w, h); // padding may have changed
+        }
+        if errors {
+            show_config_errors(self.hwnd, &self.config);
+        }
+        self.dirty = true;
     }
 
     fn output_arrived(&mut self) {
@@ -284,7 +311,9 @@ impl Window {
         if self.pane.pump() {
             self.dirty = true;
         }
-        if let Some(title) = self.pane.take_title() {
+        if let Some(title) = self.pane.take_title()
+            && self.config.title.is_none()
+        {
             let title = if title.is_empty() { "Wisp".to_owned() } else { title };
             unsafe {
                 let _ = SetWindowTextW(self.hwnd, &HSTRING::from(title));
@@ -304,15 +333,24 @@ impl Window {
         if vk == VK_PROCESSKEY.0 {
             return false;
         }
-        if down && let Some(action) = default_binding(VIRTUAL_KEY(vk), current_mods()) {
-            take_typed_chars(self.hwnd); // e.g. the ^V that Ctrl+Shift+V would type
-            self.perform(action);
-            return true;
+        if down && let Some(binding) = self.config.bindings.lookup(vk, current_mods()) {
+            // A `performable:` binding whose action can't run (copy with nothing
+            // selected) lets the key through to the program instead.
+            if self.perform(binding.action) || !binding.performable {
+                take_typed_chars(self.hwnd); // e.g. the ^V that Ctrl+Shift+V would type
+                return true;
+            }
         }
         if down && !is_modifier(VIRTUAL_KEY(vk)) {
             // Like Ghostty: typing jumps back to the live screen and drops the selection.
             self.pane.scroll(ScrollViewport::Bottom);
-            self.pane.clear_selection();
+            if self.config.selection_clear_on_typing {
+                self.pane.clear_selection();
+            }
+            if self.config.mouse_hide_while_typing && !self.pointer_hidden {
+                self.pointer_hidden = true;
+                unsafe { SetCursor(None) };
+            }
             self.dirty = true;
         }
         if !self.pane.win32_input {
@@ -347,13 +385,13 @@ impl Window {
         true
     }
 
-    fn perform(&mut self, action: Action) {
+    /// Runs a bound action. Returns false if it had nothing to act on.
+    fn perform(&mut self, action: Action) -> bool {
         let page = self.pane.terminal.rows().unwrap_or(1) as isize;
+        self.dirty = true;
         match action {
-            Action::CopyToClipboard => {
-                self.copy_selection();
-            }
-            Action::PasteFromClipboard => self.paste_clipboard(),
+            Action::CopyToClipboard => return self.copy_selection(),
+            Action::PasteFromClipboard => return self.paste_clipboard(),
             Action::SelectAll => {
                 let term = &self.pane.terminal;
                 if let Ok(Some(all)) = term.select_all() {
@@ -362,24 +400,62 @@ impl Window {
             }
             Action::ScrollPageUp => self.pane.scroll(ScrollViewport::Delta(-page)),
             Action::ScrollPageDown => self.pane.scroll(ScrollViewport::Delta(page)),
+            Action::ScrollToTop => self.pane.scroll(ScrollViewport::Top),
+            Action::ScrollToBottom => self.pane.scroll(ScrollViewport::Bottom),
+            Action::IncreaseFontSize(by) => self.set_font_size(self.font_size + by),
+            Action::DecreaseFontSize(by) => self.set_font_size(self.font_size - by),
+            Action::ResetFontSize => self.set_font_size(self.config.font_size),
+            Action::ReloadConfig => self.reload_config(),
+            Action::OpenConfig => open_config(self.hwnd),
+            Action::NewWindow => {
+                if let Err(e) = Window::open(self.config.clone()) {
+                    eprintln!("opening a window failed: {e}");
+                }
+            }
+            // Closing goes through WM_CLOSE so the window isn't destroyed while
+            // this call still holds its state.
+            Action::CloseSurface | Action::CloseTab | Action::CloseWindow => unsafe {
+                let _ = PostMessageW(Some(self.hwnd), WM_CLOSE, WPARAM(0), LPARAM(0));
+            },
+            Action::Quit => {
+                for hwnd in WINDOWS.with_borrow(Vec::clone) {
+                    unsafe {
+                        let _ = PostMessageW(Some(hwnd), WM_CLOSE, WPARAM(0), LPARAM(0));
+                    }
+                }
+            }
+            Action::Ignore => {}
+            // ponytail: tabs, splits and fullscreen arrive in M5; until then their keys do nothing.
+            other => eprintln!("{other:?} isn't implemented yet"),
         }
-        self.dirty = true;
+        true
+    }
+
+    fn set_font_size(&mut self, size: f32) {
+        let size = size.clamp(4.0, 200.0);
+        if size != self.font_size {
+            self.font_size = size;
+            self.rebuild_font();
+        }
     }
 
     /// Copies the selection, if there is one. Returns whether there was.
     fn copy_selection(&mut self) -> bool {
-        let Some(text) = self.pane.selection_text() else { return false };
+        let Some(text) = self.pane.selection_text().filter(|t| !t.is_empty()) else { return false };
         clipboard::set_text(Some(self.hwnd), &text);
         true
     }
 
-    fn paste_clipboard(&mut self) {
-        let Some(text) = clipboard::get_text(Some(self.hwnd)).filter(|t| !t.is_empty()) else { return };
-        if self.pane.paste_needs_confirmation(&text) && !confirm_paste(self.hwnd, &text) {
-            return;
+    /// Pastes the clipboard's text. Returns false if there was none.
+    fn paste_clipboard(&mut self) -> bool {
+        let Some(text) = clipboard::get_text(Some(self.hwnd)).filter(|t| !t.is_empty()) else { return false };
+        let risky = self.config.clipboard_paste_protection && self.pane.paste_needs_confirmation(&text);
+        if risky && !confirm_paste(self.hwnd, &text) {
+            return true;
         }
         self.pane.scroll(ScrollViewport::Bottom);
         self.pane.paste(&text);
+        true
     }
 
     fn layout(&self) -> Layout {
@@ -388,24 +464,36 @@ impl Window {
             height: self.surface.height,
             cell_width: self.font.cell_width,
             cell_height: self.font.cell_height,
-            padding: padding_px(self.dpi),
+            padding: padding_px(&self.config, self.dpi),
         }
     }
 
     fn mouse_button(&mut self, button: Button, down: bool, x: f32, y: f32) {
         let (mods, layout) = (current_mods(), self.layout());
         self.pointer = (x, y);
-        // Right-click copies the selection, or pastes when there is none,
-        // the way conhost and Windows Terminal do (Ghostty's copy-or-paste).
+        // Right-click copies the selection or pastes, the way conhost and
+        // Windows Terminal do, unless `right-click-action` says otherwise.
         if button == Button::Right && down && !Mouse::reports(&self.pane.terminal, mods) {
-            if self.copy_selection() {
-                self.pane.clear_selection();
-            } else {
-                self.paste_clipboard();
+            match self.config.right_click_action {
+                RightClick::CopyOrPaste => {
+                    if self.copy_selection() {
+                        self.pane.clear_selection();
+                    } else {
+                        self.paste_clipboard();
+                    }
+                }
+                RightClick::Copy => {
+                    self.copy_selection();
+                }
+                RightClick::Paste => {
+                    self.paste_clipboard();
+                }
+                RightClick::Ignore => {}
             }
             self.dirty = true;
             return;
         }
+        let ends_selection = button == Button::Left && !down && self.pane.mouse.is_selecting();
         unsafe {
             if down {
                 SetCapture(self.hwnd);
@@ -424,12 +512,16 @@ impl Window {
             eprintln!("mouse button: {e}");
         }
         self.pane.write(&out);
+        if ends_selection && self.config.copy_on_select {
+            self.copy_selection();
+        }
         self.run_autoscroll_timer();
         self.dirty = true;
     }
 
     fn mouse_moved(&mut self, x: f32, y: f32) {
         self.pointer = (x, y);
+        self.pointer_hidden = false;
         let (mods, layout) = (current_mods(), self.layout());
         let mut out = Vec::new();
         let Pane { mouse, terminal, .. } = &mut self.pane;
@@ -565,26 +657,92 @@ fn wheel_scroll_lines() -> f32 {
     if lines == u32::MAX { 10.0 } else { lines as f32 }
 }
 
-fn padding_px(dpi: u32) -> u32 {
-    (PADDING_PT * dpi as f32 / 72.0).round() as u32
+/// The configured padding (in points) in pixels at this DPI.
+fn padding_px(config: &Config, dpi: u32) -> Padding {
+    let px = |pt: f32| (pt * dpi as f32 / 72.0).round() as u32;
+    Padding {
+        left: px(config.window_padding_x.0),
+        right: px(config.window_padding_x.1),
+        top: px(config.window_padding_y.0),
+        bottom: px(config.window_padding_y.1),
+    }
 }
 
-fn grid_size(font: &Font, padding: u32, width: u32, height: u32) -> SizeReportSize {
-    let inner = |total: u32| total.saturating_sub(2 * padding);
+fn grid_size(font: &Font, padding: Padding, width: u32, height: u32) -> SizeReportSize {
     SizeReportSize {
-        columns: (inner(width) / font.cell_width).max(1) as u16,
-        rows: (inner(height) / font.cell_height).max(1) as u16,
+        columns: (width.saturating_sub(padding.left + padding.right) / font.cell_width).max(1) as u16,
+        rows: (height.saturating_sub(padding.top + padding.bottom) / font.cell_height).max(1) as u16,
         cell_width: font.cell_width,
         cell_height: font.cell_height,
     }
 }
 
-/// Dark title bar in the terminal's background color, so the frame blends in.
-fn style_title_bar(hwnd: HWND) {
-    let bg = crate::term::DEFAULT_BACKGROUND;
-    let colorref = bg.r as u32 | (bg.g as u32) << 8 | (bg.b as u32) << 16;
+/// PowerShell 7 if it's installed, otherwise the Windows PowerShell every
+/// Windows install has.
+fn default_shell() -> String {
+    let on_path = |exe: &str| {
+        std::env::var_os("PATH").is_some_and(|path| std::env::split_paths(&path).any(|dir| dir.join(exe).is_file()))
+    };
+    let shell = if on_path("pwsh.exe") { "pwsh.exe" } else { "powershell.exe" };
+    format!("{shell} -NoLogo")
+}
+
+/// Logs config problems to stderr: errors, and keys Wisp doesn't support yet.
+pub fn report(config: &Config) {
+    for error in &config.errors {
+        eprintln!("config error: {error}");
+    }
+    for key in &config.unsupported {
+        eprintln!("config: not supported yet, ignored: {key}");
+    }
+}
+
+fn show_config_errors(hwnd: HWND, config: &Config) {
+    let file = config.path.as_ref().map_or("the command line".into(), |p| p.display().to_string());
+    let list: String = config.errors.iter().take(12).map(|e| format!("\u{2022} {e}\n")).collect();
+    let message = format!("Some settings in {file} couldn't be applied:\n\n{list}\nEverything else is in effect.");
     unsafe {
-        let dark = BOOL(1);
+        MessageBoxW(Some(hwnd), &HSTRING::from(message), w!("Wisp configuration"), MB_OK | MB_ICONWARNING);
+    }
+}
+
+/// Opens the config file in an editor, creating it with some pointers first.
+fn open_config(hwnd: HWND) {
+    let Some(path) = crate::config::default_path() else { return };
+    if !path.exists() {
+        let _ = std::fs::create_dir_all(path.parent().unwrap());
+        let _ = std::fs::write(&path, CONFIG_TEMPLATE);
+    }
+    let file = HSTRING::from(path.as_os_str());
+    unsafe {
+        // `.ghostty` files have no editor associated by default; Notepad always works.
+        let opened = ShellExecuteW(Some(hwnd), w!("open"), &file, None, None, SW_SHOWNORMAL);
+        if opened.0 as usize <= 32 {
+            ShellExecuteW(Some(hwnd), w!("open"), w!("notepad.exe"), &file, None, SW_SHOWNORMAL);
+        }
+    }
+}
+
+const CONFIG_TEMPLATE: &str = "\
+# Wisp reads Ghostty's config format: https://ghostty.org/docs/config
+# Save, then press Ctrl+Shift+, to reload. Lines starting with # are comments.
+
+# font-family = Cascadia Code
+# font-size = 12
+# theme = light:Catppuccin Latte,dark:Catppuccin Mocha
+# cursor-style = bar
+# window-padding-x = 4
+# keybind = performable:ctrl+c=copy_to_clipboard
+";
+
+/// A dark or light title bar in the terminal's background color, so the
+/// frame and the terminal read as one surface.
+fn style_title_bar(hwnd: HWND, config: &Config) {
+    let bg = config.background;
+    let colorref = bg.r as u32 | (bg.g as u32) << 8 | (bg.b as u32) << 16;
+    let dark_background = (bg.r as u32 * 299 + bg.g as u32 * 587 + bg.b as u32 * 114) / 1000 < 128;
+    unsafe {
+        let dark = BOOL(dark_background as i32);
         let _ = DwmSetWindowAttribute(hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE, (&raw const dark).cast(), 4);
         let _ = DwmSetWindowAttribute(hwnd, DWMWA_CAPTION_COLOR, (&raw const colorref).cast(), 4);
         // The default 1px border is translucent and shows whatever is behind the window.
@@ -620,6 +778,17 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpar
     let Ok(mut window) = cell.try_borrow_mut() else { return default() };
     match msg {
         WM_APP_OUTPUT => window.output_arrived(),
+        WM_APP_CONFIG_ERRORS => show_config_errors(hwnd, &window.config),
+        WM_SETTINGCHANGE => {
+            // Windows switched between light and dark mode: a `light:...,dark:...`
+            // theme follows it.
+            let setting = lparam.0 as *const u16;
+            if !setting.is_null() && unsafe { PCWSTR(setting).to_string() }.is_ok_and(|s| s == "ImmersiveColorSet") {
+                window.reload_config();
+            }
+            drop(window);
+            return default();
+        }
         WM_APP_EXITED => {
             drop(window);
             unsafe {
@@ -689,10 +858,12 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpar
             window.mouse_button(Button::Left, false, x, y);
         }
         WM_SETCURSOR if (lparam.0 & 0xffff) as u32 == HTCLIENT => {
-            // An arrow when clicks go to the program, an I-beam when they select text.
+            // An arrow when clicks go to the program, an I-beam when they select
+            // text, nothing while typing hides it.
             let shape = if Mouse::reports(&window.pane.terminal, current_mods()) { IDC_ARROW } else { IDC_IBEAM };
             unsafe {
-                let _ = SetCursor(LoadCursorW(None, shape).ok());
+                let cursor = if window.pointer_hidden { None } else { LoadCursorW(None, shape).ok() };
+                let _ = SetCursor(cursor);
             }
             return LRESULT(1);
         }
