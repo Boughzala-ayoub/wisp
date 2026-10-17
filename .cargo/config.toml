@@ -1,0 +1,6 @@
+# libghostty-vt-sys clones Ghostty under target/ by default, which overflows
+# MAX_PATH on Windows. Point it at the pinned checkout from scripts/bootstrap.ps1.
+[env]
+GHOSTTY_SOURCE_DIR = { value = ".tools/ghostty", relative = true }
+# Build the VT parser optimized even in debug builds; a Debug Zig build is ~10x slower.
+LIBGHOSTTY_VT_SYS_OPTIMIZE = "ReleaseFast"
