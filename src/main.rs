@@ -11,6 +11,7 @@ mod layout;
 mod mouse;
 mod pty;
 mod render;
+mod shells;
 mod sprite;
 mod term;
 mod window;

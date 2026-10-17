@@ -253,6 +253,8 @@ impl Theme {
 pub struct FrameInfo {
     /// The cursor is in a blinking mode, so the window should run the blink timer.
     pub cursor_blinks: bool,
+    /// Where the cursor's cell is, in pixels, blinking or not; the IME follows it.
+    pub cursor_at: Option<(f32, f32)>,
 }
 
 pub struct Renderer {
@@ -266,8 +268,9 @@ pub struct Renderer {
     globals: ID3D11Buffer,
     coverage_atlas: Atlas,
     color_atlas: Atlas,
-    /// `None` marks glyphs with no ink (spaces) so they aren't rasterized again.
-    glyphs: HashMap<(FaceId, u16), Option<Slot>>,
+    /// Cached glyphs by font, face and glyph id. `None` marks glyphs with no
+    /// ink (spaces) so they aren't rasterized again.
+    glyphs: HashMap<(u32, FaceId, u16), Option<Slot>>,
     atlas_full: bool,
     /// Enhanced-contrast strength for dark and for light text; see the shader.
     pub text_contrast: [f32; 2],
@@ -422,6 +425,7 @@ impl Renderer {
         let (cw, ch) = (font.cell_width as f32, font.cell_height as f32);
 
         let cursor_blinks = snapshot.cursor_blinking()?;
+        let cursor_at = snapshot.cursor_viewport()?.map(|c| (ox + c.x as f32 * cw, oy + c.y as f32 * ch));
         let cursor_shown = snapshot.cursor_visible()? && (blink_on || !cursor_blinks || !focused);
         let cursor = if cursor_shown { snapshot.cursor_viewport()? } else { None };
         let cursor_style = if focused { snapshot.cursor_visual_style()? } else { CursorVisualStyle::BlockHollow };
@@ -596,7 +600,7 @@ impl Renderer {
         }
 
         snapshot.set_dirty(Dirty::Clean)?;
-        Ok(FrameInfo { cursor_blinks: cursor_blinks && snapshot.cursor_visible()? })
+        Ok(FrameInfo { cursor_blinks: cursor_blinks && snapshot.cursor_visible()?, cursor_at })
     }
 
     fn solid(&mut self, x: f32, y: f32, width: f32, height: f32, color: [f32; 4]) {
@@ -698,7 +702,10 @@ impl Renderer {
 
     /// Finds a glyph in an atlas, rasterizing and uploading it on first use.
     fn slot(&mut self, font: &Font, face: FaceId, glyph: u16) -> Option<Slot> {
-        if let Some(slot) = self.glyphs.get(&(face, glyph)) {
+        // The terminal, tab-title and icon fonts all draw through this cache; the
+        // same glyph id means a different shape in each.
+        let key = (font.id(), face, glyph);
+        if let Some(slot) = self.glyphs.get(&key) {
             return *slot;
         }
         let bitmap = if face == SPRITE_FACE {
@@ -733,7 +740,7 @@ impl Renderer {
                 Some(Slot { x, y, width: b.width, height: b.height, left: b.left, top: b.top, color })
             }
         };
-        self.glyphs.insert((face, glyph), slot);
+        self.glyphs.insert(key, slot);
         slot
     }
 
@@ -1226,6 +1233,38 @@ pub mod tests {
         assert!((0..w).all(|x| lit(x, row)), "no gaps between the three cells");
         let col = (cw..cw * 2).find(|&x| lit(x, ch + ch / 2)).expect("the vertical line");
         assert!((ch..ch * 3).all(|y| lit(col, y)), "no gap between the two rows");
+    }
+
+    #[test]
+    fn fonts_sharing_the_renderer_dont_swap_glyphs() {
+        // The icon font's "+" happened to share a glyph id with Cascadia's
+        // contextual "<" and showed up in the middle of "<=".
+        let render = |with_icons_first: bool| {
+            let mut renderer = Renderer::with_driver(D3D_DRIVER_TYPE_WARP).unwrap();
+            if with_icons_first {
+                let families = ["Segoe Fluent Icons".to_owned(), "Segoe MDL2 Assets".to_owned()];
+                let mut icons = Font::new(&families, 7.5, 96, &[]).unwrap();
+                for icon in ['\u{E710}', '\u{E8BB}', '\u{E921}', '\u{E922}'] {
+                    renderer.icon(
+                        &mut icons,
+                        icon,
+                        Rect { x: 0, y: 0, width: 20, height: 20 },
+                        RgbColor { r: 0, g: 0, b: 0 },
+                        0.0,
+                    );
+                }
+                renderer.quads.clear();
+            }
+            let mut font = Font::new(&["Cascadia Code".into()], 12.0, 96, &[]).unwrap();
+            let size =
+                SizeReportSize { rows: 1, columns: 8, cell_width: font.cell_width, cell_height: font.cell_height };
+            let config = crate::config::Config::default();
+            let mut pane = Pane::spawn("cmd.exe /c exit", None, size, &config, || {}, || {}).unwrap();
+            pane.terminal.vt_write(b"\x1b[H\x1b[2J\x1b[?25la <= b");
+            renderer.draw_pane(&mut pane, &mut font, (0.0, 0.0), true, true).unwrap();
+            render_offscreen(&mut renderer, font.cell_width * 8, font.cell_height, config.background)
+        };
+        assert!(render(true) == render(false), "drawing icons first changed how the terminal text looks");
     }
 
     #[test]

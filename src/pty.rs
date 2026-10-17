@@ -3,22 +3,79 @@
 //! Windows has no Unix-style pty. Instead, `CreatePseudoConsole` starts a
 //! hidden conhost that hosts the child's console and talks VT to us over two
 //! pipes: we write keystrokes into one and read rendered output from the other.
+//!
+//! The conhost built into Windows lags behind the one Windows Terminal ships.
+//! When `conpty.dll` and `OpenConsole.exe` from Microsoft's ConPTY package sit
+//! next to `wisp.exe`, Wisp uses that newer one instead; `WISP_INBOX_CONPTY=1`
+//! forces the built-in one.
 
 use std::ffi::c_void;
 use std::fs::File;
 use std::io::{self, Write};
 use std::os::windows::io::FromRawHandle;
+use std::sync::OnceLock;
 use std::thread;
 
-use windows::Win32::Foundation::{CloseHandle, HANDLE};
-use windows::Win32::System::Console::{COORD, ClosePseudoConsole, CreatePseudoConsole, HPCON, ResizePseudoConsole};
+use windows::Win32::Foundation::{CloseHandle, HANDLE, HMODULE};
+use windows::Win32::System::Console::{COORD, HPCON};
+use windows::Win32::System::LibraryLoader::{
+    GetModuleHandleW, GetProcAddress, LOAD_LIBRARY_SEARCH_APPLICATION_DIR, LoadLibraryExW,
+};
 use windows::Win32::System::Pipes::CreatePipe;
 use windows::Win32::System::Threading::{
     CREATE_UNICODE_ENVIRONMENT, CreateProcessW, DeleteProcThreadAttributeList, EXTENDED_STARTUPINFO_PRESENT, INFINITE,
     InitializeProcThreadAttributeList, LPPROC_THREAD_ATTRIBUTE_LIST, PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE,
     PROCESS_INFORMATION, STARTF_USESTDHANDLES, STARTUPINFOEXW, UpdateProcThreadAttribute, WaitForSingleObject,
 };
-use windows::core::{PCWSTR, PWSTR, Result};
+use windows::core::{HRESULT, PCWSTR, PWSTR, Result, w};
+
+/// conhost measures character widths by grapheme cluster, as libghostty-vt does
+/// in mode 2027, so emoji sequences take the same number of cells on both sides.
+/// Only the bundled conhost understands it.
+const PSEUDOCONSOLE_GLYPH_WIDTH_GRAPHEMES: u32 = 0x08;
+
+type CreateFn = unsafe extern "system" fn(COORD, HANDLE, HANDLE, u32, *mut HPCON) -> HRESULT;
+type ResizeFn = unsafe extern "system" fn(HPCON, COORD) -> HRESULT;
+type CloseFn = unsafe extern "system" fn(HPCON);
+/// What GetProcAddress returns, before it's cast to the real signature.
+type Proc = unsafe extern "system" fn() -> isize;
+
+/// One ConPTY implementation's entry points.
+struct ConPty {
+    create: CreateFn,
+    resize: ResizeFn,
+    close: CloseFn,
+    bundled: bool,
+}
+
+/// The bundled ConPTY if it's next to the exe, otherwise the one in kernel32.
+fn conpty() -> &'static ConPty {
+    static CHOSEN: OnceLock<ConPty> = OnceLock::new();
+    CHOSEN.get_or_init(|| unsafe {
+        let bundled = std::env::var_os("WISP_INBOX_CONPTY")
+            .is_none()
+            .then(|| LoadLibraryExW(w!("conpty.dll"), None, LOAD_LIBRARY_SEARCH_APPLICATION_DIR).ok())
+            .flatten();
+        let load = |module: HMODULE, prefix: &str, bundled: bool| -> Option<ConPty> {
+            let get = |name: &str| GetProcAddress(module, windows::core::PCSTR(format!("{prefix}{name}\0").as_ptr()));
+            Some(ConPty {
+                create: std::mem::transmute::<Proc, CreateFn>(get("CreatePseudoConsole")?),
+                resize: std::mem::transmute::<Proc, ResizeFn>(get("ResizePseudoConsole")?),
+                close: std::mem::transmute::<Proc, CloseFn>(get("ClosePseudoConsole")?),
+                bundled,
+            })
+        };
+        bundled
+            .and_then(|module| load(module, "Conpty", true))
+            .or_else(|| load(GetModuleHandleW(w!("kernel32.dll")).ok()?, "", false))
+            .expect("kernel32 has had ConPTY since Windows 10 1809")
+    })
+}
+
+/// Whether panes run on the bundled conhost (OpenConsole) rather than Windows' own.
+pub fn uses_bundled_conpty() -> bool {
+    conpty().bundled
+}
 
 /// A child process running inside a pseudoconsole.
 pub struct Pty {
@@ -41,9 +98,12 @@ impl Pty {
             CreatePipe(&mut in_read, &mut in_write, None, 0)?;
             CreatePipe(&mut out_read, &mut out_write, None, 0)?;
 
-            // dwFlags = 0: the inherit-cursor flag makes conhost wait for a cursor
-            // position reply, and other projects saw it deadlock ClosePseudoConsole.
-            let hpc = CreatePseudoConsole(size(cols, rows), in_read, out_write, 0)?;
+            // No inherit-cursor flag: it makes conhost wait for a cursor position
+            // reply, and other projects saw it deadlock ClosePseudoConsole.
+            let api = conpty();
+            let flags = if api.bundled { PSEUDOCONSOLE_GLYPH_WIDTH_GRAPHEMES } else { 0 };
+            let mut hpc = HPCON::default();
+            (api.create)(size(cols, rows), in_read, out_write, flags, &mut hpc).ok()?;
             // conhost duplicated its ends. Ours would keep the pipes open forever.
             CloseHandle(in_read)?;
             CloseHandle(out_write)?;
@@ -93,7 +153,7 @@ impl Pty {
             });
             DeleteProcThreadAttributeList(attrs);
             if let Err(e) = spawned {
-                ClosePseudoConsole(hpc);
+                (api.close)(hpc);
                 return Err(e);
             }
             CloseHandle(info.hThread)?;
@@ -113,7 +173,7 @@ impl Pty {
     }
 
     pub fn resize(&self, cols: u16, rows: u16) -> Result<()> {
-        unsafe { ResizePseudoConsole(self.hpc, size(cols, rows)) }
+        unsafe { (conpty().resize)(self.hpc, size(cols, rows)).ok() }
     }
 
     /// Calls `on_exit` from a background thread once the child process ends.
@@ -139,7 +199,7 @@ impl Drop for Pty {
         let hpc = SendHandle(self.hpc.0 as usize);
         thread::spawn(move || {
             let hpc = hpc;
-            unsafe { ClosePseudoConsole(HPCON(hpc.0 as isize)) }
+            unsafe { (conpty().close)(HPCON(hpc.0 as isize)) }
         });
         if let Some(process) = self.process.take() {
             unsafe {
@@ -168,14 +228,18 @@ fn wide(s: &str) -> Vec<u16> {
 
 /// Our environment plus the variables that tell programs what they're talking to.
 fn environment_block() -> Vec<u16> {
+    const OURS: [&str; 3] = ["COLORTERM", "TERM_PROGRAM", "TERM_PROGRAM_VERSION"];
     let mut vars: Vec<(String, String)> = std::env::vars()
-        .filter(|(k, _)| {
-            !matches!(k.to_ascii_uppercase().as_str(), "TERM_PROGRAM" | "TERM_PROGRAM_VERSION" | "COLORTERM")
-        })
+        .filter(|(k, _)| !OURS.contains(&k.to_ascii_uppercase().as_str()) && !k.eq_ignore_ascii_case("WSLENV"))
         .collect();
     vars.push(("COLORTERM".into(), "truecolor".into()));
     vars.push(("TERM_PROGRAM".into(), "wisp".into()));
     vars.push(("TERM_PROGRAM_VERSION".into(), env!("CARGO_PKG_VERSION").into()));
+    // WSL only passes Windows variables named in WSLENV (`/u`: into Linux only).
+    let existing = std::env::var("WSLENV").unwrap_or_default();
+    let ours = OURS.map(|name| format!("{name}/u")).join(":");
+    let wslenv = if existing.is_empty() { ours } else { format!("{existing}:{ours}") };
+    vars.push(("WSLENV".into(), wslenv));
     // CreateProcess expects the block sorted, case-insensitively, by name.
     vars.sort_by_key(|(k, _)| k.to_ascii_uppercase());
     let mut block = Vec::new();

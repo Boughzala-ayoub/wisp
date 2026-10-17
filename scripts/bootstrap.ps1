@@ -37,5 +37,29 @@ if (-not (Test-Path "$ghostty\build.zig")) {
     git -C $ghostty checkout -q FETCH_HEAD
 }
 
+# Microsoft's ConPTY package: a newer conhost (OpenConsole) than the one in
+# Windows. build.rs copies it next to wisp.exe; Wisp falls back to Windows'
+# own if it's missing.
+$conptyVersion = "1.25.260930003"
+$conptySha512 = "LuqMk9r5oTzeRne35IOlUdSQ7DkjorOIbcnODGZ81MvmUpTr/1VBQz3fAdCNCwkfuR0Mluq+H7rS3Hes/A1fOw=="
+$conpty = Join-Path $tools "conpty"
+if (-not (Test-Path "$conpty\OpenConsole.exe")) {
+    Write-Output "Downloading Microsoft.Windows.Console.ConPTY $conptyVersion..."
+    $nupkg = Join-Path $tools "conpty.zip"
+    Invoke-WebRequest "https://api.nuget.org/v3-flatcontainer/microsoft.windows.console.conpty/$conptyVersion/microsoft.windows.console.conpty.$conptyVersion.nupkg" -OutFile $nupkg
+    $hash = [Convert]::ToBase64String([Security.Cryptography.SHA512]::Create().ComputeHash([IO.File]::ReadAllBytes($nupkg)))
+    if ($hash -ne $conptySha512) {
+        Remove-Item $nupkg
+        throw "ConPTY package failed its checksum"
+    }
+    $unpacked = Join-Path $tools "conpty-package"
+    Expand-Archive $nupkg $unpacked -Force
+    New-Item -ItemType Directory -Force $conpty | Out-Null
+    Copy-Item "$unpacked\runtimes\win-x64\native\conpty.dll" $conpty
+    Copy-Item "$unpacked\build\native\runtimes\x64\OpenConsole.exe" $conpty
+    Remove-Item $nupkg
+    Remove-Item $unpacked -Recurse
+}
+
 $env:PATH = "$zig;$env:PATH"
 Write-Output "Ready: Zig $(& "$zig\zig.exe" version) is on PATH for this session."

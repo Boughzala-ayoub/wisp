@@ -187,3 +187,39 @@ Things that surprised me:
 - **Windows has to be told where your buttons are.** Snap layouts, double-click to maximize and
   dragging all come from answering `WM_NCHITTEST` with the right codes. The buttons are drawn by
   Wisp, but their behavior is still Windows'.
+
+## M6: every shell, and a newer conhost
+
+*2026-10-17*
+
+![A WSL Ubuntu tab next to Git Bash and Windows PowerShell tabs](docs/devlog/m6-wsl.png)
+
+The chevron next to the new-tab button lists every shell Wisp finds: PowerShell 7, Windows
+PowerShell, Command Prompt, Git Bash and each WSL distribution, read from the registry instead of
+by running `wsl.exe`. Tabs are named after their shell until the program sets a title. Windows'
+variables like `COLORTERM` now reach WSL through `WSLENV`, so programs inside Linux know they have
+truecolor. The IME's composition and candidate windows sit at the cursor, in the terminal's font.
+
+Wisp now ships Microsoft's ConPTY package (`conpty.dll` + `OpenConsole.exe`, version 1.25, MIT,
+checked against NuGet's SHA-512) and falls back to the conhost built into Windows if it's missing.
+`WISP_INBOX_CONPTY=1` switches back for comparison.
+
+| | |
+|---|---|
+| Shells detected and tested on this machine | Windows PowerShell, Command Prompt, Git Bash, Ubuntu (WSL) |
+| Launch to first frame | median 144 ms (139 ms on the in-box ConPTY); still dominated by Direct3D device creation |
+| Tests | 58, plus 2 opt-in; one test starts every detected shell and checks it ran |
+
+Things that surprised me:
+
+- **The newer conhost talks less.** The built-in one clears the screen and sets a title before the
+  shell prints anything. The bundled one asks for device attributes and then passes the program's
+  output through almost untouched. It can also measure character widths by grapheme cluster
+  (`PSEUDOCONSOLE_GLYPH_WIDTH_GRAPHEMES`), which matches libghostty-vt's mode 2027, so an emoji
+  with a skin-tone modifier takes the same width on both sides.
+- **A `+` appeared in the middle of `<=`.** The new-tab icon and Cascadia's contextual `<` happened
+  to share a glyph id, and the glyph cache didn't know which font a glyph came from. The bug arrived
+  with M5's title bar fonts, and the ConPTY switch nearly took the blame. A trace of the raw bytes
+  cleared conhost, and a new test now draws icons before terminal text and compares the pixels.
+- **`wsl.exe` keeps quotes as part of the name.** `wsl -d "Ubuntu"` fails with "no distribution
+  with the supplied name". WSL names can't contain spaces, so Wisp passes them bare.

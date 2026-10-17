@@ -17,6 +17,8 @@ pub struct Metrics {
     pub tab_top: i32,
     pub margin: i32,
     pub new_tab_width: i32,
+    /// The chevron next to the new-tab button that lists the shells.
+    pub menu_width: i32,
     pub close_size: i32,
     /// Caption kept free between the tabs and the buttons, to drag the window by.
     pub drag_space: i32,
@@ -33,6 +35,7 @@ impl Metrics {
             tab_top: px(6.0),
             margin: px(6.0),
             new_tab_width: px(34.0),
+            menu_width: px(24.0),
             close_size: px(20.0),
             drag_space: px(48.0),
         }
@@ -49,6 +52,8 @@ pub enum Hit {
     Tab(usize),
     CloseTab(usize),
     NewTab,
+    /// Opens the list of shells to start a tab with.
+    NewTabMenu,
 }
 
 #[derive(Clone, Debug)]
@@ -57,6 +62,7 @@ pub struct Bar {
     /// Each tab's close button.
     pub closes: Vec<Rect>,
     pub new_tab: Rect,
+    pub menu: Rect,
     pub minimize: Rect,
     pub maximize: Rect,
     pub close: Rect,
@@ -68,7 +74,7 @@ impl Bar {
     pub fn new(width: i32, tabs: usize, m: &Metrics) -> Bar {
         let button =
             |i: i32| Rect { x: width - (3 - i) * m.button_width, y: 0, width: m.button_width, height: m.height };
-        let room = (width - 3 * m.button_width - m.margin - m.new_tab_width - m.drag_space).max(0);
+        let room = (width - 3 * m.button_width - m.margin - m.new_tab_width - m.menu_width - m.drag_space).max(0);
         // ponytail: past the minimum width, extra tabs run under the buttons; a scrolling strip if anyone opens that many.
         let tab_width = (room / tabs.max(1) as i32).clamp(m.tab_min, m.tab_max);
         let tab_rects: Vec<Rect> = (0..tabs as i32)
@@ -88,6 +94,12 @@ impl Bar {
             tabs: tab_rects,
             closes,
             new_tab: Rect { x: after_tabs, y: m.tab_top, width: m.new_tab_width, height: m.height - m.tab_top },
+            menu: Rect {
+                x: after_tabs + m.new_tab_width,
+                y: m.tab_top,
+                width: m.menu_width,
+                height: m.height - m.tab_top,
+            },
             minimize: button(0),
             maximize: button(1),
             close: button(2),
@@ -113,6 +125,9 @@ impl Bar {
         if self.new_tab.contains(x, y) {
             return Hit::NewTab;
         }
+        if self.menu.contains(x, y) {
+            return Hit::NewTabMenu;
+        }
         Hit::Caption
     }
 }
@@ -130,7 +145,8 @@ mod tests {
         assert!(many.tabs[0].width < m.tab_max && many.tabs[0].width >= m.tab_min);
         let last = many.tabs.last().unwrap();
         assert!(many.new_tab.x >= last.x + last.width);
-        assert!(many.new_tab.x + many.new_tab.width + m.drag_space <= many.minimize.x, "room left to drag the window");
+        assert_eq!(many.menu.x, many.new_tab.x + many.new_tab.width);
+        assert!(many.menu.x + many.menu.width + m.drag_space <= many.minimize.x, "room left to drag the window");
     }
 
     #[test]
@@ -143,6 +159,7 @@ mod tests {
         let close = bar.closes[0];
         assert_eq!(bar.hit(close.x + 2, close.y + 2), Hit::CloseTab(0));
         assert_eq!(bar.hit(bar.new_tab.x + 5, 20), Hit::NewTab);
+        assert_eq!(bar.hit(bar.menu.x + 5, 20), Hit::NewTabMenu);
         assert_eq!(bar.hit(bar.tabs[0].x + 10, 2), Hit::Caption, "the strip above the tabs drags the window");
     }
 

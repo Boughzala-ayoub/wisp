@@ -68,6 +68,8 @@ struct Face {
 /// One monospace font family at one pixel size, plus whatever fallback
 /// fonts its text has needed so far.
 pub struct Font {
+    /// Unique per instance, so caches can tell fonts apart.
+    id: u32,
     factory: IDWriteFactory2,
     analyzer: IDWriteTextAnalyzer,
     fallback: IDWriteFontFallback,
@@ -166,7 +168,9 @@ impl Font {
             let underline_y = (baseline - px(m.underlinePosition as f32)).round();
             let strikethrough_y = (baseline - px(m.strikethroughPosition as f32)).round();
 
+            static NEXT_ID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
             Ok(Font {
+                id: NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
                 analyzer: factory.CreateTextAnalyzer()?,
                 fallback,
                 factory,
@@ -190,6 +194,10 @@ impl Font {
                 strikethrough_y: strikethrough_y as u32,
             })
         }
+    }
+
+    pub fn id(&self) -> u32 {
+        self.id
     }
 
     /// Shapes `text` in the given style (a combination of [`BOLD`] and

@@ -71,6 +71,8 @@ impl Pane {
         let max_scrollback = config.scrollback_lines(size.columns);
         let mut terminal = Terminal::new(Options { cols: size.columns, rows: size.rows, max_scrollback })?;
         terminal.resize(size.columns, size.rows, size.cell_width, size.cell_height)?;
+        // Measure widths by grapheme cluster when conhost does too, so both agree where the cursor is.
+        terminal.set_mode(Mode::GRAPHEME_CLUSTER, crate::pty::uses_bundled_conpty())?;
 
         let size = Rc::new(Cell::new(size));
         let title_changed = Rc::new(Cell::new(false));
@@ -307,19 +309,27 @@ fn contains(haystack: &[u8], needle: &[u8]) -> bool {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use libghostty_vt::fmt::{Format, Formatter, FormatterOptions};
-    use std::sync::mpsc::channel;
-    use std::time::{Duration, Instant};
-
-    fn screen_text(pane: &Pane) -> String {
-        let mut f = Formatter::new(&pane.terminal, FormatterOptions::new().with_format(Format::Plain)).unwrap();
+impl Pane {
+    /// The visible screen as plain text, for tests to look for output in.
+    pub fn screen_text(&self) -> String {
+        use libghostty_vt::fmt::{Formatter, FormatterOptions};
+        let mut f = Formatter::new(&self.terminal, FormatterOptions::new().with_format(Format::Plain)).unwrap();
         // format_len reports an empty screen as InvalidValue rather than 0.
         let Ok(len) = f.format_len() else { return String::new() };
         let mut buf = vec![0; len];
         let n = f.format_buf(&mut buf).unwrap();
         String::from_utf8_lossy(&buf[..n]).into_owned()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::mpsc::channel;
+    use std::time::{Duration, Instant};
+
+    fn screen_text(pane: &Pane) -> String {
+        pane.screen_text()
     }
 
     #[test]

@@ -11,10 +11,12 @@ in Ghostty on a Mac: fast, sharp text, nothing in the way.
 
 ## Status
 
-Early. Milestones 1 to 5 of 7 are done: PowerShell runs through ConPTY, text renders with
+Early. Milestones 1 to 6 of 7 are done: PowerShell runs through ConPTY, text renders with
 ligatures, color emoji, font fallback and seamless box drawing, the mouse selects, scrolls and
 reaches programs that track it, a Ghostty-format config with themes and keybinds applies live, and
-the window has tabs in its title bar, Ghostty-style splits, acrylic or Mica, and fullscreen. See
+the window has tabs in its title bar, Ghostty-style splits, acrylic or Mica, and fullscreen. A menu
+opens PowerShell, Command Prompt, Git Bash or any WSL distribution, running on Microsoft's newer
+ConPTY when it's bundled. See
 [PLAN.md](PLAN.md) for the milestones and [DEVLOG.md](DEVLOG.md) for progress with measured
 numbers.
 
@@ -24,7 +26,9 @@ Ghostty doesn't ship for Windows, and upstream recommends building Windows termi
 libghostty-vt instead of porting the app. That library parses VT output and keeps the terminal
 state. Wisp adds everything around it in Rust:
 
-- `pty.rs` runs the shell inside a Windows pseudoconsole (ConPTY).
+- `pty.rs` runs the shell inside a Windows pseudoconsole (ConPTY), preferring the newer conhost
+  from Microsoft's ConPTY package when it sits next to `wisp.exe`. `shells.rs` finds the installed
+  shells.
 - `term.rs` feeds the shell's output to libghostty-vt and answers its queries.
 - `input.rs` sends keys in conhost's win32-input-mode, so key combinations like Shift+Enter
   survive the trip through ConPTY.
@@ -36,7 +40,8 @@ state. Wisp adds everything around it in Rust:
 - `config.rs` and `bindings.rs` read Ghostty-format config files, themes and keybinds.
 
 Set `WISP_TRACE_PTY=1` to log everything that crosses the pseudoconsole to stderr, and
-`WISP_TRACE_STARTUP=1` to time each stage of startup.
+`WISP_TRACE_STARTUP=1` to time each stage of startup. `WISP_INBOX_CONPTY=1` uses the conhost built
+into Windows even when the bundled one is there.
 - `window.rs` owns the Win32 window, its tabs and splits, and paces frames to the display with a
   waitable swap chain. `chrome.rs` lays out the title bar and `layout.rs` the split tree.
 

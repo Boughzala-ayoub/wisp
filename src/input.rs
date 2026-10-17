@@ -73,14 +73,6 @@ mod tests {
     fn conhost_understands_our_keys() {
         let size = SizeReportSize { rows: 24, columns: 80, cell_width: 9, cell_height: 19 };
         let mut pane = Pane::spawn("cmd.exe /k", None, size, &crate::config::Config::default(), || {}, || {}).unwrap();
-        let screen = |pane: &Pane| {
-            use libghostty_vt::fmt::{Format, Formatter, FormatterOptions};
-            let mut f = Formatter::new(&pane.terminal, FormatterOptions::new().with_format(Format::Plain)).unwrap();
-            let Ok(len) = f.format_len() else { return String::new() };
-            let mut buf = vec![0; len];
-            let n = f.format_buf(&mut buf).unwrap();
-            String::from_utf8_lossy(&buf[..n]).into_owned()
-        };
         let deadline = Instant::now() + Duration::from_secs(10);
         while !pane.win32_input {
             assert!(Instant::now() < deadline, "conhost never asked for win32-input-mode");
@@ -101,8 +93,8 @@ mod tests {
         }
         pane.write(keys.as_bytes());
         // "w32ok" shows up twice: once as the typed command, once as its output.
-        while screen(&pane).matches("w32ok").count() < 2 {
-            assert!(Instant::now() < deadline, "screen: {:?}", screen(&pane));
+        while pane.screen_text().matches("w32ok").count() < 2 {
+            assert!(Instant::now() < deadline, "screen: {:?}", pane.screen_text());
             std::thread::sleep(Duration::from_millis(20));
             pane.pump();
         }

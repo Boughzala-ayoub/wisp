@@ -25,13 +25,17 @@ use windows::Win32::Graphics::Dwm::{
     DWMWA_SYSTEMBACKDROP_TYPE, DWMWA_USE_IMMERSIVE_DARK_MODE, DwmExtendFrameIntoClientArea, DwmSetWindowAttribute,
 };
 use windows::Win32::Graphics::Gdi::{
-    BeginPaint, EndPaint, GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromWindow, PAINTSTRUCT,
-    ScreenToClient,
+    BeginPaint, ClientToScreen, EndPaint, GetMonitorInfoW, LOGFONTW, MONITOR_DEFAULTTONEAREST, MONITORINFO,
+    MonitorFromWindow, PAINTSTRUCT, ScreenToClient,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::{INFINITE, WaitForSingleObject};
 use windows::Win32::UI::Controls::{MARGINS, WM_MOUSELEAVE};
 use windows::Win32::UI::HiDpi::{AdjustWindowRectExForDpi, GetDpiForWindow, GetSystemMetricsForDpi};
+use windows::Win32::UI::Input::Ime::{
+    CANDIDATEFORM, CFS_CANDIDATEPOS, CFS_POINT, COMPOSITIONFORM, ImmGetContext, ImmReleaseContext,
+    ImmSetCandidateWindow, ImmSetCompositionFontW, ImmSetCompositionWindow,
+};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetFocus, GetKeyState, ReleaseCapture, SetCapture, TME_LEAVE, TME_NONCLIENT, TRACKMOUSEEVENT, TrackMouseEvent,
     VIRTUAL_KEY, VK_CAPITAL, VK_CONTROL, VK_DOWN, VK_F4, VK_LWIN, VK_MENU, VK_NUMLOCK, VK_PACKET, VK_PROCESSKEY,
@@ -50,6 +54,7 @@ use crate::input::{KeyEvent, control_key_state};
 use crate::layout::{Axis, Divider, Node, PaneId, Rect, neighbor};
 use crate::mouse::{Button, Layout, Mouse, Padding, Wheel};
 use crate::render::{Renderer, Surface, Theme};
+use crate::shells::{self, Shell};
 use crate::term::Pane;
 
 const WM_APP_OUTPUT: u32 = WM_APP + 1;
@@ -71,6 +76,7 @@ const ICON_MAXIMIZE: char = '\u{E922}';
 const ICON_RESTORE: char = '\u{E923}';
 const ICON_CLOSE: char = '\u{E8BB}';
 const ICON_ADD: char = '\u{E710}';
+const ICON_CHEVRON_DOWN: char = '\u{E70D}';
 /// Windows 11's red for a hovered close button.
 const CLOSE_RED: RgbColor = RgbColor { r: 0xC4, g: 0x2B, b: 0x1C };
 const WHITE: RgbColor = RgbColor { r: 255, g: 255, b: 255 };
@@ -120,6 +126,8 @@ pub struct Window {
     /// Panes by id; closed panes leave a `None`.
     panes: Vec<Option<Pane>>,
     pane_titles: Vec<String>,
+    /// Each pane's shell name, the tab title until the program sets its own.
+    pane_names: Vec<String>,
     tabs: Vec<Tab>,
     active: usize,
     dpi: u32,
@@ -150,6 +158,8 @@ pub struct Window {
     /// Placement and style to restore when leaving fullscreen.
     fullscreen: Option<(WINDOWPLACEMENT, isize)>,
     window_title: String,
+    /// The focused cursor's position in client pixels, where IME windows go.
+    ime_spot: Option<(i32, i32)>,
 }
 
 impl Window {
@@ -224,7 +234,9 @@ impl Window {
             // The shell starts while the renderer (built on another thread) may still be coming.
             let output_pending = Arc::new(AtomicBool::new(false));
             let area = (width, (height as i32 - title_height).max(1) as u32);
-            let first = start_pane(hwnd, &output_pending, 0, None, grid_size(&font, padding, area.0, area.1), &config)?;
+            let command = config.command.clone().unwrap_or_else(shells::default_command);
+            let first_size = grid_size(&font, padding, area.0, area.1);
+            let first = start_pane(hwnd, &output_pending, 0, &command, None, first_size, &config)?;
             crate::startup_mark("shell started");
             let mut renderer = renderer()?;
             crate::startup_mark("Direct3D device and shaders ready");
@@ -247,6 +259,7 @@ impl Window {
                 font,
                 panes: vec![Some(first)],
                 pane_titles: vec![String::new()],
+                pane_names: vec![shells::name_for(&command)],
                 tabs: vec![Tab { tree: Node::Leaf(0), focused: 0, zoomed: false }],
                 active: 0,
                 dpi,
@@ -267,6 +280,7 @@ impl Window {
                 pressed: None,
                 fullscreen: None,
                 window_title: String::new(),
+                ime_spot: None,
             };
             crate::startup_mark("UI fonts loaded");
             window.relayout();
@@ -295,18 +309,33 @@ impl Window {
         self.tabs[self.active].focused
     }
 
-    /// Starts a shell in a new pane, in `cwd` if given.
-    fn spawn_pane(&mut self, cwd: Option<String>) -> std::result::Result<PaneId, Box<dyn std::error::Error>> {
+    /// Starts a shell in a new pane, in `cwd` if given: `shell`, or the
+    /// configured `command`, or the default shell.
+    fn spawn_pane(
+        &mut self,
+        cwd: Option<String>,
+        shell: Option<Shell>,
+    ) -> std::result::Result<PaneId, Box<dyn std::error::Error>> {
         let id = self.panes.iter().position(Option::is_none).unwrap_or(self.panes.len());
+        let (command, name) = match shell {
+            Some(shell) => (shell.command, shell.name),
+            None => {
+                let command = self.config.command.clone().unwrap_or_else(shells::default_command);
+                let name = shells::name_for(&command);
+                (command, name)
+            }
+        };
         // A first guess; relayout gives it its real size once it's in the tree.
         let size = grid_size(&self.font, padding_px(&self.config, self.dpi), self.surface.width, self.surface.height);
-        let pane = start_pane(self.hwnd, &self.output_pending, id, cwd, size, &self.config)?;
+        let pane = start_pane(self.hwnd, &self.output_pending, id, &command, cwd, size, &self.config)?;
         if id == self.panes.len() {
             self.panes.push(Some(pane));
             self.pane_titles.push(String::new());
+            self.pane_names.push(name);
         } else {
             self.panes[id] = Some(pane);
             self.pane_titles[id] = String::new();
+            self.pane_names[id] = name;
         }
         Ok(id)
     }
@@ -316,8 +345,8 @@ impl Window {
         self.tabs.get(self.active).and_then(|t| self.pane(t.focused).working_directory())
     }
 
-    fn new_tab(&mut self) -> std::result::Result<(), Box<dyn std::error::Error>> {
-        let id = self.spawn_pane(self.inherited_cwd())?;
+    fn new_tab(&mut self, shell: Option<Shell>) -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let id = self.spawn_pane(self.inherited_cwd(), shell)?;
         let at = if self.tabs.is_empty() { 0 } else { self.active + 1 };
         self.tabs.insert(at, Tab { tree: Node::Leaf(id), focused: id, zoomed: false });
         self.active = at;
@@ -327,7 +356,7 @@ impl Window {
 
     fn new_split(&mut self, toward: Direction) {
         let cwd = self.inherited_cwd();
-        let id = match self.spawn_pane(cwd) {
+        let id = match self.spawn_pane(cwd, None) {
             Ok(id) => id,
             Err(e) => return eprintln!("starting a shell for the split failed: {e}"),
         };
@@ -444,6 +473,7 @@ impl Window {
         let focused = self.focused_id();
         let split = visible.len() > 1;
         let mut blinks = false;
+        let mut ime_spot = None;
         for &(id, rect) in &visible {
             self.renderer.clip(rect);
             let origin = ((rect.x + padding.left as i32) as f32, (rect.y + padding.top as i32) as f32);
@@ -458,6 +488,9 @@ impl Window {
             }
             let frame = renderer.draw_pane(pane, font, origin, is_focused, *blink_on)?;
             blinks |= is_focused && frame.cursor_blinks;
+            if id == focused {
+                ime_spot = frame.cursor_at.map(|(x, y)| (x as i32, y as i32));
+            }
             if split && id != focused {
                 // Unfocused splits fade toward the background, as in Ghostty.
                 let wash = 1.0 - self.config.unfocused_split_opacity;
@@ -478,7 +511,36 @@ impl Window {
         self.renderer.render(&target, w, h, self.config.background, self.config.background_opacity)?;
         self.surface.present()?;
         self.run_blink_timer(blinks);
+        if ime_spot.is_some() && ime_spot != self.ime_spot {
+            self.ime_spot = ime_spot;
+            self.place_ime();
+        }
         Ok(())
+    }
+
+    /// Puts the IME's composition text and candidate list at the cursor, in
+    /// the terminal's font, so Chinese, Japanese and Korean input happens in
+    /// place rather than in a corner of the screen.
+    fn place_ime(&self) {
+        let Some((x, y)) = self.ime_spot else { return };
+        unsafe {
+            let context = ImmGetContext(self.hwnd);
+            if context.is_invalid() {
+                return;
+            }
+            let at = POINT { x, y };
+            let composition = COMPOSITIONFORM { dwStyle: CFS_POINT, ptCurrentPos: at, rcArea: RECT::default() };
+            let _ = ImmSetCompositionWindow(context, &composition);
+            let below = POINT { x, y: y + self.font.cell_height as i32 };
+            let candidates =
+                CANDIDATEFORM { dwIndex: 0, dwStyle: CFS_CANDIDATEPOS, ptCurrentPos: below, rcArea: RECT::default() };
+            let _ = ImmSetCandidateWindow(context, &candidates);
+            let mut font = LOGFONTW { lfHeight: -(self.font.em_px.round() as i32), ..Default::default() };
+            let family: Vec<u16> = self.config.font_families()[0].encode_utf16().take(31).collect();
+            font.lfFaceName[..family.len()].copy_from_slice(&family);
+            let _ = ImmSetCompositionFontW(context, &font);
+            let _ = ImmReleaseContext(self.hwnd, context);
+        }
     }
 
     fn title_bar(&self) -> (Bar, Metrics) {
@@ -532,6 +594,10 @@ impl Window {
             self.renderer.fill(bar.new_tab, fg, 0.08);
         }
         self.renderer.icon(&mut self.icon_font, ICON_ADD, bar.new_tab, fg, 0.8);
+        if self.hover == Some(Hit::NewTabMenu) {
+            self.renderer.fill(bar.menu, fg, 0.08);
+        }
+        self.renderer.icon(&mut self.icon_font, ICON_CHEVRON_DOWN, bar.menu, fg, 0.6);
 
         let maximized = unsafe { IsZoomed(self.hwnd) }.as_bool();
         let buttons = [
@@ -554,7 +620,39 @@ impl Window {
 
     /// A tab's title: its focused pane's, with an executable path shortened to its name.
     fn tab_title(&self, index: usize) -> String {
-        pretty_title(&self.pane_titles[self.tabs[index].focused])
+        let id = self.tabs[index].focused;
+        pretty_title(&self.pane_titles[id], &self.pane_names[id])
+    }
+
+    /// Lists the installed shells under the chevron; the chosen one opens in a new tab.
+    fn shell_menu(&mut self) {
+        const OPEN_CONFIG: usize = 1000;
+        let shells = shells::detect();
+        let (bar, _) = self.title_bar();
+        unsafe {
+            let Ok(menu) = CreatePopupMenu() else { return };
+            for (i, shell) in shells.iter().enumerate() {
+                let _ = AppendMenuW(menu, MF_STRING, i + 1, &HSTRING::from(&shell.name));
+            }
+            let _ = AppendMenuW(menu, MF_SEPARATOR, 0, None);
+            let _ = AppendMenuW(menu, MF_STRING, OPEN_CONFIG, w!("Settings (config file)\tCtrl+,"));
+            let mut at = POINT { x: bar.menu.x, y: bar.menu.y + bar.menu.height };
+            let _ = ClientToScreen(self.hwnd, &mut at);
+            let flags = TPM_RETURNCMD | TPM_LEFTALIGN | TPM_TOPALIGN;
+            let chosen = TrackPopupMenu(menu, flags, at.x, at.y, None, self.hwnd, None);
+            let _ = DestroyMenu(menu);
+            match chosen.0 as usize {
+                0 => {}
+                OPEN_CONFIG => open_config(self.hwnd),
+                n => {
+                    if let Err(e) = self.new_tab(shells.get(n - 1).cloned()) {
+                        eprintln!("opening a tab failed: {e}");
+                    }
+                }
+            }
+        }
+        self.hover = None;
+        self.dirty = true;
     }
 
     fn update_title(&mut self) {
@@ -791,7 +889,7 @@ impl Window {
                 }
             }
             Action::NewTab => {
-                if let Err(e) = self.new_tab() {
+                if let Err(e) = self.new_tab(None) {
                     eprintln!("opening a tab failed: {e}");
                 }
             }
@@ -1076,10 +1174,11 @@ impl Window {
                 }
             }
             (Button::Left, Hit::NewTab) => {
-                if let Err(e) = self.new_tab() {
+                if let Err(e) = self.new_tab(None) {
                     eprintln!("opening a tab failed: {e}");
                 }
             }
+            (Button::Left, Hit::NewTabMenu) => self.shell_menu(),
             _ => {}
         }
         self.dirty = true;
@@ -1233,7 +1332,7 @@ impl Window {
             Hit::Minimize => HTMINBUTTON,
             Hit::Maximize => HTMAXBUTTON,
             Hit::Close => HTCLOSE,
-            Hit::Tab(_) | Hit::CloseTab(_) | Hit::NewTab => HTCLIENT,
+            Hit::Tab(_) | Hit::CloseTab(_) | Hit::NewTab | Hit::NewTabMenu => HTCLIENT,
         }
     }
 
@@ -1291,12 +1390,13 @@ impl Window {
     }
 }
 
-/// Starts the configured shell for pane `id` of window `hwnd`. Its reader
+/// Starts `command` for pane `id` of window `hwnd`. Its reader
 /// thread wakes the window through `pending`; its exit posts WM_APP_EXITED.
 fn start_pane(
     hwnd: HWND,
     pending: &Arc<AtomicBool>,
     id: PaneId,
+    command: &str,
     cwd: Option<String>,
     size: SizeReportSize,
     config: &Config,
@@ -1311,8 +1411,7 @@ fn start_pane(
     let exited = move || {
         let _ = unsafe { PostMessageW(Some(HWND(target as _)), WM_APP_EXITED, WPARAM(id), LPARAM(0)) };
     };
-    let command = config.command.clone().unwrap_or_else(default_shell);
-    Pane::spawn(&command, cwd.as_deref(), size, config, wake, exited)
+    Pane::spawn(command, cwd.as_deref(), size, config, wake, exited)
 }
 
 /// Removes the WM_CHAR messages TranslateMessage queued for the key being handled.
@@ -1403,24 +1502,11 @@ fn is_dark(c: RgbColor) -> bool {
     (c.r as u32 * 299 + c.g as u32 * 587 + c.b as u32 * 114) / 1000 < 128
 }
 
-/// `C:\WINDOWS\System32\WindowsPowerShell\v1.0\powershell.exe` reads better as `powershell`.
-fn pretty_title(title: &str) -> String {
-    let lower = title.to_ascii_lowercase();
-    if lower.ends_with(".exe") && (title.contains('\\') || !title.contains(' ')) {
-        let name = title.rsplit(['\\', '/']).next().unwrap_or(title);
-        return name[..name.len() - 4].to_owned();
-    }
-    if title.is_empty() { "Wisp".to_owned() } else { title.to_owned() }
-}
-
-/// PowerShell 7 if it's installed, otherwise the Windows PowerShell every
-/// Windows install has.
-fn default_shell() -> String {
-    let on_path = |exe: &str| {
-        std::env::var_os("PATH").is_some_and(|path| std::env::split_paths(&path).any(|dir| dir.join(exe).is_file()))
-    };
-    let shell = if on_path("pwsh.exe") { "pwsh.exe" } else { "powershell.exe" };
-    format!("{shell} -NoLogo")
+/// The program's own title, unless it's empty or just the path of the
+/// executable (conhost's default), in which case the shell's name reads better.
+fn pretty_title(title: &str, shell_name: &str) -> String {
+    let is_exe_path = title.to_ascii_lowercase().ends_with(".exe") && (title.contains('\\') || !title.contains(' '));
+    if title.is_empty() || is_exe_path { shell_name.to_owned() } else { title.to_owned() }
 }
 
 /// Logs config problems to stderr: errors, and keys Wisp doesn't support yet.
@@ -1614,6 +1700,11 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpar
             }
         }
         WM_CHAR => window.char(wparam.0 as u16),
+        WM_IME_STARTCOMPOSITION => {
+            window.place_ime();
+            drop(window);
+            return default();
+        }
         WM_SIZE => {
             if wparam.0 as u32 != SIZE_MINIMIZED {
                 let (width, height) = ((lparam.0 & 0xffff) as u32, ((lparam.0 >> 16) & 0xffff) as u32);
@@ -1781,10 +1872,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn executable_paths_shorten_to_their_name() {
-        assert_eq!(pretty_title("C:\\WINDOWS\\System32\\WindowsPowerShell\\v1.0\\powershell.exe"), "powershell");
-        assert_eq!(pretty_title("cmd.exe"), "cmd");
-        assert_eq!(pretty_title("vim notes.txt"), "vim notes.txt");
-        assert_eq!(pretty_title(""), "Wisp");
+    fn conhost_default_titles_give_way_to_the_shell_name() {
+        let path = "C:\\WINDOWS\\System32\\WindowsPowerShell\\v1.0\\powershell.exe";
+        assert_eq!(pretty_title(path, "Windows PowerShell"), "Windows PowerShell");
+        assert_eq!(pretty_title("cmd.exe", "Command Prompt"), "Command Prompt");
+        assert_eq!(pretty_title("", "Ubuntu"), "Ubuntu");
+        assert_eq!(pretty_title("vim notes.txt", "Ubuntu"), "vim notes.txt");
     }
 }
