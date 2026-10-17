@@ -67,7 +67,11 @@ impl Pane {
         let mut terminal =
             Terminal::new(Options { cols: size.columns, rows: size.rows, max_scrollback: SCROLLBACK_LINES })?;
         terminal.resize(size.columns, size.rows, size.cell_width, size.cell_height)?;
-        terminal.set_default_bg_color(Some(DEFAULT_BACKGROUND))?.set_default_fg_color(Some(DEFAULT_FOREGROUND))?;
+        terminal
+            .set_default_bg_color(Some(DEFAULT_BACKGROUND))?
+            .set_default_fg_color(Some(DEFAULT_FOREGROUND))?
+            // Ghostty blinks the cursor unless a program asks it not to.
+            .set_default_cursor_blink(Some(true))?;
 
         let size = Rc::new(Cell::new(size));
         let title_changed = Rc::new(Cell::new(false));

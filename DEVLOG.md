@@ -40,3 +40,40 @@ Things that surprised me:
   goes to whatever window has focus. When Wisp didn't have it, the keystrokes went elsewhere. The
   script now posts messages straight to Wisp's window and captures with `PrintWindow`, so it works
   with the window in the background.
+
+## M2: text that looks right
+
+*2026-10-17*
+
+![Ligatures, emoji, CJK, underline styles and box drawing in Wisp](docs/devlog/m2-text.png)
+
+Cascadia Code's ligatures now form (`=>` becomes an arrow, `!=` becomes `≠`), emoji render in color,
+and Chinese, Japanese and Korean text comes from the fonts Windows falls back to. All five underline
+styles work, including colored curly underlines. The cursor blinks every 600 ms like Ghostty's and
+turns hollow when the window loses focus.
+
+Each row is split into runs of same-style text, and DirectWrite shapes each run. A run also ends at
+the cursor, the same as Ghostty's default, so a ligature never forms around the character you're
+typing. Characters the font lacks go to the system font fallback. Color emoji come from Segoe UI
+Emoji's layered COLR glyphs, which Wisp composites into a second RGBA atlas.
+
+| | |
+|---|---|
+| Building a full 120x40 frame (CPU) | 2.73 ms before caching shaped runs, 0.41 ms after |
+| Launch to first frame | 127 to 189 ms over six warm launches, median about 144 ms |
+| Tests | 25, plus an opt-in frame benchmark |
+
+Things that surprised me:
+
+- **Fonts can't draw seamless boxes.** Once a 9.6 px advance rounds to a 10 px cell, `─` leaves a
+  gap on every cell and borders look dashed. Claude Code draws its whole UI with `╭─╮│╰─╯`, so
+  that was not acceptable. Wisp now draws box drawing, block elements and Powerline arrows itself,
+  sized to the exact cell, the way Ghostty does. The rounded corners are quarter circles placed so
+  they meet the straight lines on both sides.
+- **conhost keeps curly underlines.** ConPTY re-renders the console's buffer instead of passing
+  output straight through, so I expected styles conhost doesn't model to disappear. Curly, dotted,
+  dashed and colored underlines all survive the round trip on this Windows build.
+- **libghostty-vt's cursor doesn't blink by default.** Ghostty's app blinks, so an embedder that
+  wants the same behavior has to set the default blink state on the terminal itself.
+- **Shaping dominates the frame.** Before the cache, almost all of the 2.7 ms went to DirectWrite
+  analyzing and shaping runs that hadn't changed since the last frame.

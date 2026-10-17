@@ -1,13 +1,13 @@
 //! Direct3D 11 renderer. A frame is a list of quads drawn in one instanced
-//! call: solid rectangles (cell backgrounds, cursor, underlines) and glyphs
-//! cut from a coverage atlas and tinted with their cell's color.
+//! call: solid rectangles (cell backgrounds, cursor, lines), glyphs cut from
+//! one of two atlases, and underline patterns computed in the pixel shader.
 
 use std::collections::HashMap;
 use std::ffi::c_void;
 
 use libghostty_vt::render::{CursorVisualStyle, Dirty};
 use libghostty_vt::screen::CellWide;
-use libghostty_vt::style::{RgbColor, Underline};
+use libghostty_vt::style::{RgbColor, StyleColor, Underline};
 use windows::Win32::Foundation::{HANDLE, HMODULE, HWND, TRUE};
 use windows::Win32::Graphics::Direct3D::Fxc::{D3DCOMPILE_OPTIMIZATION_LEVEL3, D3DCompile};
 use windows::Win32::Graphics::Direct3D::{
@@ -16,8 +16,9 @@ use windows::Win32::Graphics::Direct3D::{
 };
 use windows::Win32::Graphics::Direct3D11::*;
 use windows::Win32::Graphics::Dxgi::Common::{
-    DXGI_ALPHA_MODE_IGNORE, DXGI_FORMAT, DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_R8_UNORM, DXGI_FORMAT_R32_UINT,
-    DXGI_FORMAT_R32G32_FLOAT, DXGI_FORMAT_R32G32B32A32_FLOAT, DXGI_FORMAT_UNKNOWN, DXGI_SAMPLE_DESC,
+    DXGI_ALPHA_MODE_IGNORE, DXGI_FORMAT, DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_R8_UNORM, DXGI_FORMAT_R8G8B8A8_UNORM,
+    DXGI_FORMAT_R32_FLOAT, DXGI_FORMAT_R32_UINT, DXGI_FORMAT_R32G32_FLOAT, DXGI_FORMAT_R32G32B32A32_FLOAT,
+    DXGI_FORMAT_UNKNOWN, DXGI_SAMPLE_DESC,
 };
 use windows::Win32::Graphics::Dxgi::{
     DXGI_MWA_NO_ALT_ENTER, DXGI_PRESENT, DXGI_SCALING_NONE, DXGI_SWAP_CHAIN_DESC1, DXGI_SWAP_CHAIN_FLAG,
@@ -26,28 +27,41 @@ use windows::Win32::Graphics::Dxgi::{
 };
 use windows::core::{Interface, PCSTR, Result, s};
 
-use crate::font::{BOLD, FaceStyle, Font, ITALIC};
+use crate::font::{BOLD, FaceId, Font, ITALIC, Pixels, ShapedGlyph};
+use crate::sprite;
 use crate::term::Pane;
 
 const ATLAS_SIZE: u32 = 2048;
+/// Glyph cache key face for characters drawn by [`sprite`] rather than a font.
+const SPRITE_FACE: FaceId = FaceId::MAX;
+
+// Quad kinds; keep in sync with the shader.
 const SOLID: u32 = 0;
 const GLYPH: u32 = 1;
+const COLOR_GLYPH: u32 = 2;
+const CURLY: u32 = 3;
+const DOTTED: u32 = 4;
+const DASHED: u32 = 5;
 
 const SHADER: &str = r#"
 cbuffer Globals : register(b0) { float2 pixel_to_clip; };
-Texture2D<float> atlas : register(t0);
+Texture2D<float> coverage_atlas : register(t0);
+Texture2D<float4> color_atlas : register(t1);
 
 struct Quad {
     float4 rect : RECT;          // x, y, width, height in pixels
-    float2 uv : UV;              // top-left texel in the atlas
+    float2 uv : UV;              // top-left texel in the atlas (glyphs)
     float4 color : COLOR;        // straight alpha
-    uint kind : KIND;            // 0 = solid, 1 = glyph
+    uint kind : KIND;
+    float param : PARAM;         // pattern period (underlines)
 };
 struct Pixel {
     float4 pos : SV_Position;
     float2 uv : UV;
     nointerpolation float4 color : COLOR;
+    nointerpolation float4 rect : RECT;
     nointerpolation uint kind : KIND;
+    nointerpolation float param : PARAM;
 };
 
 Pixel vs_main(Quad q, uint id : SV_VertexID) {
@@ -57,13 +71,39 @@ Pixel vs_main(Quad q, uint id : SV_VertexID) {
     o.pos = float4(p.x * pixel_to_clip.x - 1, 1 - p.y * pixel_to_clip.y, 0, 1);
     o.uv = q.uv + corner * q.rect.zw;
     o.color = q.color;
+    o.rect = q.rect;
     o.kind = q.kind;
+    o.param = q.param;
     return o;
+}
+
+// Coverage is blended in gamma space, which makes light text on a dark
+// background look thinner than the same text dark on light. DirectWrite
+// counters that with an "enhanced contrast" curve; we scale its strength with
+// the text's brightness.
+float enhance_contrast(float coverage, float3 color) {
+    float k = lerp(0.2, 1.4, dot(color, float3(0.2126, 0.7152, 0.0722)));
+    return coverage * (k + 1) / (coverage * k + 1);
 }
 
 float4 ps_main(Pixel p) : SV_Target {
     float a = p.color.a;
-    if (p.kind == 1) a *= atlas.Load(int3(p.uv, 0));
+    if (p.kind == 1) {
+        a *= enhance_contrast(coverage_atlas.Load(int3(p.uv, 0)), p.color.rgb);
+    } else if (p.kind == 2) {
+        return color_atlas.Load(int3(p.uv, 0)) * a;
+    } else if (p.kind == 3) {
+        // A sine wave through the middle of the band, phased by absolute x so
+        // it continues smoothly from one cell to the next.
+        float thickness = max(1, p.rect.w / 3);
+        float amplitude = (p.rect.w - thickness) / 2;
+        float center = p.rect.y + p.rect.w / 2 + amplitude * sin(p.pos.x * 6.2831853 / p.param);
+        a *= saturate(thickness / 2 + 0.5 - abs(p.pos.y - center));
+    } else if (p.kind == 4) {
+        a *= fmod(floor(p.pos.x), 2 * p.param) < p.param ? 1 : 0;
+    } else if (p.kind == 5) {
+        a *= fmod(floor(p.pos.x), p.param) < p.param * 0.6 ? 1 : 0;
+    }
     return float4(p.color.rgb * a, a); // premultiplied
 }
 "#;
@@ -75,9 +115,10 @@ struct Quad {
     uv: [f32; 2],
     color: [f32; 4],
     kind: u32,
+    param: f32,
 }
 
-/// Where a rasterized glyph lives in the atlas.
+/// Where a rasterized glyph lives in its atlas.
 #[derive(Clone, Copy)]
 struct Slot {
     x: u32,
@@ -86,6 +127,7 @@ struct Slot {
     height: u32,
     left: i32,
     top: i32,
+    color: bool,
 }
 
 /// Packs glyphs left to right in rows ("shelves"), opening a new row when one fills.
@@ -114,6 +156,78 @@ impl Shelves {
     }
 }
 
+/// A glyph atlas texture and its packing state.
+struct Atlas {
+    texture: ID3D11Texture2D,
+    view: ID3D11ShaderResourceView,
+    shelves: Shelves,
+    bytes_per_pixel: u32,
+}
+
+impl Atlas {
+    fn new(device: &ID3D11Device, format: DXGI_FORMAT, bytes_per_pixel: u32) -> Result<Atlas> {
+        let desc = D3D11_TEXTURE2D_DESC {
+            Width: ATLAS_SIZE,
+            Height: ATLAS_SIZE,
+            MipLevels: 1,
+            ArraySize: 1,
+            Format: format,
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            Usage: D3D11_USAGE_DEFAULT,
+            BindFlags: D3D11_BIND_SHADER_RESOURCE.0 as u32,
+            ..Default::default()
+        };
+        unsafe {
+            let mut texture = None;
+            device.CreateTexture2D(&desc, None, Some(&mut texture))?;
+            let texture = texture.unwrap();
+            let mut view = None;
+            device.CreateShaderResourceView(&texture, None, Some(&mut view))?;
+            Ok(Atlas { texture, view: view.unwrap(), shelves: Shelves::default(), bytes_per_pixel })
+        }
+    }
+
+    /// Copies a `width` x `height` image in, returning where it went.
+    fn upload(&mut self, context: &ID3D11DeviceContext, width: u32, height: u32, data: &[u8]) -> Option<(u32, u32)> {
+        let (x, y) = self.shelves.alloc(width, height)?;
+        let region = D3D11_BOX { left: x, top: y, front: 0, right: x + width, bottom: y + height, back: 1 };
+        unsafe {
+            context.UpdateSubresource(
+                &self.texture,
+                0,
+                Some(&region),
+                data.as_ptr().cast(),
+                width * self.bytes_per_pixel,
+                0,
+            );
+        }
+        Some((x, y))
+    }
+}
+
+/// What a frame needs from one cell after the libghostty walk.
+struct CellPaint {
+    column: u16,
+    /// 2 for wide characters.
+    width: u16,
+    /// UTF-16 range of this cell's text in the row's text buffer.
+    text: std::ops::Range<usize>,
+    face: FaceId,
+    fg: [f32; 4],
+    underline: Underline,
+    underline_color: [f32; 4],
+    strikethrough: bool,
+    /// Box drawing or a block element, drawn by `sprite` to fill the cell exactly.
+    sprite: Option<char>,
+}
+
+/// What the window needs to know about the frame it just queued.
+pub struct FrameInfo {
+    pub background: RgbColor,
+    /// The cursor is in a blinking mode, so the window should run the blink timer.
+    pub cursor_blinks: bool,
+}
+
 pub struct Renderer {
     pub device: ID3D11Device,
     context: ID3D11DeviceContext,
@@ -123,14 +237,18 @@ pub struct Renderer {
     blend: ID3D11BlendState,
     raster: ID3D11RasterizerState,
     globals: ID3D11Buffer,
-    atlas: ID3D11Texture2D,
-    atlas_view: ID3D11ShaderResourceView,
-    shelves: Shelves,
+    coverage_atlas: Atlas,
+    color_atlas: Atlas,
     /// `None` marks glyphs with no ink (spaces) so they aren't rasterized again.
-    glyphs: HashMap<(FaceStyle, u16), Option<Slot>>,
+    glyphs: HashMap<(FaceId, u16), Option<Slot>>,
     atlas_full: bool,
     quads: Vec<Quad>,
     quad_buffer: Option<(ID3D11Buffer, usize)>,
+    // Scratch buffers reused across rows and frames.
+    row_cells: Vec<CellPaint>,
+    row_text: Vec<u16>,
+    unit_cell: Vec<usize>,
+    shaped: Vec<ShapedGlyph>,
 }
 
 impl Renderer {
@@ -177,6 +295,7 @@ impl Renderer {
                 element(s!("UV"), DXGI_FORMAT_R32G32_FLOAT, 16),
                 element(s!("COLOR"), DXGI_FORMAT_R32G32B32A32_FLOAT, 24),
                 element(s!("KIND"), DXGI_FORMAT_R32_UINT, 40),
+                element(s!("PARAM"), DXGI_FORMAT_R32_FLOAT, 44),
             ];
             let mut layout = None;
             device.CreateInputLayout(&elements, blob_bytes(&vs_code), Some(&mut layout))?;
@@ -214,24 +333,9 @@ impl Renderer {
             let mut globals = None;
             device.CreateBuffer(&globals_desc, None, Some(&mut globals))?;
 
-            let atlas_desc = D3D11_TEXTURE2D_DESC {
-                Width: ATLAS_SIZE,
-                Height: ATLAS_SIZE,
-                MipLevels: 1,
-                ArraySize: 1,
-                Format: DXGI_FORMAT_R8_UNORM,
-                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
-                Usage: D3D11_USAGE_DEFAULT,
-                BindFlags: D3D11_BIND_SHADER_RESOURCE.0 as u32,
-                ..Default::default()
-            };
-            let mut atlas = None;
-            device.CreateTexture2D(&atlas_desc, None, Some(&mut atlas))?;
-            let atlas = atlas.unwrap();
-            let mut atlas_view = None;
-            device.CreateShaderResourceView(&atlas, None, Some(&mut atlas_view))?;
-
             Ok(Renderer {
+                coverage_atlas: Atlas::new(&device, DXGI_FORMAT_R8_UNORM, 1)?,
+                color_atlas: Atlas::new(&device, DXGI_FORMAT_R8G8B8A8_UNORM, 4)?,
                 device,
                 context: context.unwrap(),
                 vertex_shader: vertex_shader.unwrap(),
@@ -240,13 +344,14 @@ impl Renderer {
                 blend: blend.unwrap(),
                 raster: raster.unwrap(),
                 globals: globals.unwrap(),
-                atlas,
-                atlas_view: atlas_view.unwrap(),
-                shelves: Shelves::default(),
                 glyphs: HashMap::new(),
                 atlas_full: false,
                 quads: Vec::new(),
                 quad_buffer: None,
+                row_cells: Vec::new(),
+                row_text: Vec::new(),
+                unit_cell: Vec::new(),
+                shaped: Vec::new(),
             })
         }
     }
@@ -254,19 +359,21 @@ impl Renderer {
     /// Forgets every cached glyph, e.g. after the font or DPI changed.
     pub fn clear_glyphs(&mut self) {
         self.glyphs.clear();
-        self.shelves = Shelves::default();
+        self.coverage_atlas.shelves = Shelves::default();
+        self.color_atlas.shelves = Shelves::default();
         self.atlas_full = false;
     }
 
     /// Queues a pane's visible screen with its top-left corner at `origin`.
-    /// Returns the background color, for clearing around the grid.
+    /// `blink_on` is the blink phase; a blinking cursor hides while it's false.
     pub fn draw_pane(
         &mut self,
         pane: &mut Pane,
         font: &mut Font,
         (ox, oy): (f32, f32),
         focused: bool,
-    ) -> std::result::Result<RgbColor, libghostty_vt::Error> {
+        blink_on: bool,
+    ) -> std::result::Result<FrameInfo, libghostty_vt::Error> {
         if self.atlas_full {
             // Glyphs queued last frame were dropped; start over with an empty atlas.
             self.clear_glyphs();
@@ -276,32 +383,37 @@ impl Renderer {
         let colors = snapshot.colors()?;
         let (cw, ch) = (font.cell_width as f32, font.cell_height as f32);
 
-        let cursor = if snapshot.cursor_visible()? { snapshot.cursor_viewport()? } else { None };
-        let mut cursor_style = snapshot.cursor_visual_style()?;
-        if !focused {
-            cursor_style = CursorVisualStyle::BlockHollow;
-        }
-        let cursor_color = colors.cursor.unwrap_or(colors.foreground);
+        let cursor_blinks = snapshot.cursor_blinking()?;
+        let cursor_shown = snapshot.cursor_visible()? && (blink_on || !cursor_blinks || !focused);
+        let cursor = if cursor_shown { snapshot.cursor_viewport()? } else { None };
+        let cursor_style = if focused { snapshot.cursor_visual_style()? } else { CursorVisualStyle::BlockHollow };
+        let cursor_color = rgba(colors.cursor.unwrap_or(colors.foreground), 1.0);
         let block_at = cursor.filter(|_| cursor_style == CursorVisualStyle::Block).map(|c| (c.x, c.y));
         if let Some((x, y)) = block_at {
-            self.solid(ox + x as f32 * cw, oy + y as f32 * ch, cw, ch, rgba(cursor_color, 1.0));
+            self.solid(ox + x as f32 * cw, oy + y as f32 * ch, cw, ch, cursor_color);
         }
+        // Ligatures don't form across the cursor, so text being edited stays legible.
+        let cursor_cell = cursor.map(|c| (c.x, c.y));
 
         let mut rows = row_iter.update(&snapshot)?;
         let mut y = 0u16;
-        let mut text = Vec::with_capacity(4);
+        let mut graphemes = Vec::with_capacity(4);
         while let Some(row) = rows.next() {
-            let mut cells = cell_iter.update(row)?;
             let py = oy + y as f32 * ch;
-            let mut x = 0u16;
+            self.row_cells.clear();
+            self.row_text.clear();
+            self.unit_cell.clear();
+
+            // Pass 1: walk the cells, queue backgrounds, collect text and styles.
+            let mut cells = cell_iter.update(row)?;
+            let mut column = 0u16;
             while let Some(cell) = cells.next() {
-                let px = ox + x as f32 * cw;
-                let col = x;
-                x += 1;
+                let col = column;
+                column += 1;
                 let width = match cell.raw_cell()?.wide()? {
                     CellWide::SpacerTail | CellWide::SpacerHead => continue,
-                    CellWide::Wide => 2.0,
-                    _ => 1.0,
+                    CellWide::Wide => 2,
+                    _ => 1,
                 };
                 let style = if cell.has_styling()? { Some(cell.style()?) } else { None };
                 let mut fg = cell.fg_color()?.unwrap_or(colors.foreground);
@@ -310,51 +422,115 @@ impl Renderer {
                 if inverse != cell.is_selected()? {
                     (fg, bg) = (bg.unwrap_or(colors.background), Some(fg));
                 }
-                let under_cursor = block_at == Some((col, y));
-                if under_cursor {
-                    // The cursor block replaces the background; text shows through in the background color.
+                let px = ox + col as f32 * cw;
+                if block_at == Some((col, y)) {
+                    // The cursor block replaces the background; its text shows in the background color.
                     fg = colors.background;
                 } else if let Some(bg) = bg {
-                    self.solid(px, py, cw * width, ch, rgba(bg, 1.0));
+                    self.solid(px, py, cw * width as f32, ch, rgba(bg, 1.0));
                 }
 
                 let alpha = if style.is_some_and(|s| s.faint) { 0.5 } else { 1.0 };
+                let start = self.row_text.len();
                 if cell.graphemes_len()? > 0 && !style.is_some_and(|s| s.invisible) {
-                    text.clear();
-                    text.extend(cell.graphemes()?);
-                    let face = style.map_or(0, |s| (s.bold as FaceStyle * BOLD) | (s.italic as FaceStyle * ITALIC));
-                    // ponytail: first codepoint only; shaping of clusters and ligatures comes in M2.
-                    let glyph = font.glyph_index(text[0], face);
-                    self.glyph(font, face, glyph, px, py + font.baseline as f32, rgba(fg, alpha));
-                }
-                if let Some(s) = style {
-                    let line = font.underline_thickness as f32;
-                    let line_color = match s.underline_color {
-                        libghostty_vt::style::StyleColor::Rgb(c) => c,
-                        libghostty_vt::style::StyleColor::Palette(i) => colors.palette[i.0 as usize],
-                        _ => fg,
-                    };
-                    match s.underline {
-                        Underline::None => {}
-                        Underline::Double => {
-                            self.solid(px, py + font.underline_y as f32, cw * width, line, rgba(line_color, alpha));
-                            self.solid(
-                                px,
-                                py + font.underline_y as f32 + 2.0 * line,
-                                cw * width,
-                                line,
-                                rgba(line_color, alpha),
-                            );
-                        }
-                        // ponytail: curly, dotted and dashed draw as single lines until M2.
-                        _ => self.solid(px, py + font.underline_y as f32, cw * width, line, rgba(line_color, alpha)),
-                    }
-                    if s.strikethrough {
-                        self.solid(px, py + font.strikethrough_y as f32, cw * width, line, rgba(fg, alpha));
+                    graphemes.clear();
+                    graphemes.extend(cell.graphemes()?);
+                    let mut buf = [0u16; 2];
+                    for c in &graphemes {
+                        self.row_text.extend_from_slice(c.encode_utf16(&mut buf));
                     }
                 }
+                let index = self.row_cells.len();
+                self.unit_cell.resize(self.row_text.len(), index);
+                let sprite = match graphemes.as_slice() {
+                    [c] if self.row_text.len() > start && sprite::is_sprite(*c) => Some(*c),
+                    _ => None,
+                };
+                let underline_color = match style.map(|s| s.underline_color) {
+                    Some(StyleColor::Rgb(c)) => c,
+                    Some(StyleColor::Palette(i)) => colors.palette[i.0 as usize],
+                    _ => fg,
+                };
+                self.row_cells.push(CellPaint {
+                    column: col,
+                    width,
+                    text: start..self.row_text.len(),
+                    face: style.map_or(0, |s| (s.bold as FaceId * BOLD) | (s.italic as FaceId * ITALIC)),
+                    fg: rgba(fg, alpha),
+                    underline: style.map_or(Underline::None, |s| s.underline),
+                    underline_color: rgba(underline_color, alpha),
+                    strikethrough: style.is_some_and(|s| s.strikethrough),
+                    sprite,
+                });
             }
             row.set_dirty(false)?;
+
+            // Pass 2: shape runs of adjacent, same-style text and queue their glyphs.
+            let mut i = 0;
+            while i < self.row_cells.len() {
+                let first = &self.row_cells[i];
+                if let Some(c) = first.sprite {
+                    let (x, baseline, color) = (ox + first.column as f32 * cw, py + font.baseline as f32, first.fg);
+                    self.glyph(font, SPRITE_FACE, c as u16, x, baseline, color);
+                    i += 1;
+                    continue;
+                }
+                if first.text.is_empty() {
+                    i += 1;
+                    continue;
+                }
+                let mut end = i + 1;
+                while end < self.row_cells.len() {
+                    let (prev, next) = (&self.row_cells[end - 1], &self.row_cells[end]);
+                    let at_cursor = |c: &CellPaint| cursor_cell == Some((c.column, y));
+                    let joins = !next.text.is_empty()
+                        && next.sprite.is_none()
+                        && next.face == first.face
+                        && next.column == prev.column + prev.width
+                        && !at_cursor(prev)
+                        && !at_cursor(next);
+                    if !joins {
+                        break;
+                    }
+                    end += 1;
+                }
+                let text = first.text.start..self.row_cells[end - 1].text.end;
+                self.shaped.clear();
+                if let Err(e) = font.shape(&self.row_text[text.clone()], first.face, &mut self.shaped) {
+                    eprintln!("shaping failed: {e}");
+                }
+                for k in 0..self.shaped.len() {
+                    let g = self.shaped[k];
+                    let cell = &self.row_cells[self.unit_cell[text.start + g.cluster as usize]];
+                    let (x, baseline, color) =
+                        (ox + cell.column as f32 * cw + g.x, py + font.baseline as f32 - g.y, cell.fg);
+                    self.glyph(font, g.face, g.glyph, x, baseline, color);
+                }
+                i = end;
+            }
+
+            // Pass 3: lines over the text.
+            let line = font.underline_thickness as f32;
+            for k in 0..self.row_cells.len() {
+                let cell = &self.row_cells[k];
+                let (px, w) = (ox + cell.column as f32 * cw, cw * cell.width as f32);
+                let under_y = py + font.underline_y as f32;
+                let (color, strike_color, strike) = (cell.underline_color, cell.fg, cell.strikethrough);
+                match cell.underline {
+                    Underline::Single => self.solid(px, under_y, w, line, color),
+                    Underline::Double => {
+                        self.solid(px, under_y - line, w, line, color);
+                        self.solid(px, under_y + line, w, line, color);
+                    }
+                    Underline::Curly => self.pattern(CURLY, px, under_y - line, w, line * 3.0, color, cw),
+                    Underline::Dotted => self.pattern(DOTTED, px, under_y, w, line, color, line),
+                    Underline::Dashed => self.pattern(DASHED, px, under_y, w, line, color, cw / 2.0),
+                    _ => {}
+                }
+                if strike {
+                    self.solid(px, py + font.strikethrough_y as f32, w, line, strike_color);
+                }
+            }
             y += 1;
         }
 
@@ -362,30 +538,34 @@ impl Renderer {
             let (px, py) = (ox + c.x as f32 * cw, oy + c.y as f32 * ch);
             let line = (font.underline_thickness as f32).max(1.0);
             match cursor_style {
-                CursorVisualStyle::Bar => self.solid(px, py, (line * 2.0).max(2.0), ch, rgba(cursor_color, 1.0)),
-                CursorVisualStyle::Underline => {
-                    self.solid(px, py + ch - line * 2.0, cw, line * 2.0, rgba(cursor_color, 1.0))
-                }
+                CursorVisualStyle::Bar => self.solid(px, py, (line * 2.0).max(2.0), ch, cursor_color),
+                CursorVisualStyle::Underline => self.solid(px, py + ch - line * 2.0, cw, line * 2.0, cursor_color),
                 CursorVisualStyle::BlockHollow => {
-                    self.solid(px, py, cw, line, rgba(cursor_color, 1.0));
-                    self.solid(px, py + ch - line, cw, line, rgba(cursor_color, 1.0));
-                    self.solid(px, py, line, ch, rgba(cursor_color, 1.0));
-                    self.solid(px + cw - line, py, line, ch, rgba(cursor_color, 1.0));
+                    self.solid(px, py, cw, line, cursor_color);
+                    self.solid(px, py + ch - line, cw, line, cursor_color);
+                    self.solid(px, py, line, ch, cursor_color);
+                    self.solid(px + cw - line, py, line, ch, cursor_color);
                 }
                 _ => {}
             }
         }
 
         snapshot.set_dirty(Dirty::Clean)?;
-        Ok(colors.background)
+        Ok(FrameInfo { background: colors.background, cursor_blinks: cursor_blinks && snapshot.cursor_visible()? })
     }
 
     fn solid(&mut self, x: f32, y: f32, width: f32, height: f32, color: [f32; 4]) {
-        self.quads.push(Quad { rect: [x, y, width, height], uv: [0.0; 2], color, kind: SOLID });
+        self.quads.push(Quad { rect: [x, y, width, height], uv: [0.0; 2], color, kind: SOLID, param: 0.0 });
+    }
+
+    /// A line drawn by the shader in a repeating pattern of the given period.
+    #[allow(clippy::too_many_arguments, reason = "a rectangle plus how to fill it")]
+    fn pattern(&mut self, kind: u32, x: f32, y: f32, width: f32, height: f32, color: [f32; 4], period: f32) {
+        self.quads.push(Quad { rect: [x, y, width, height], uv: [0.0; 2], color, kind, param: period });
     }
 
     /// Queues a glyph with its pen at `x` on the baseline `baseline`.
-    fn glyph(&mut self, font: &Font, face: FaceStyle, glyph: u16, x: f32, baseline: f32, color: [f32; 4]) {
+    fn glyph(&mut self, font: &Font, face: FaceId, glyph: u16, x: f32, baseline: f32, color: [f32; 4]) {
         let Some(slot) = self.slot(font, face, glyph) else { return };
         self.quads.push(Quad {
             rect: [
@@ -396,35 +576,46 @@ impl Renderer {
             ],
             uv: [slot.x as f32, slot.y as f32],
             color,
-            kind: GLYPH,
+            kind: if slot.color { COLOR_GLYPH } else { GLYPH },
+            param: 0.0,
         });
     }
 
-    /// Finds a glyph in the atlas, rasterizing and uploading it on first use.
-    fn slot(&mut self, font: &Font, face: FaceStyle, glyph: u16) -> Option<Slot> {
+    /// Finds a glyph in an atlas, rasterizing and uploading it on first use.
+    fn slot(&mut self, font: &Font, face: FaceId, glyph: u16) -> Option<Slot> {
         if let Some(slot) = self.glyphs.get(&(face, glyph)) {
             return *slot;
         }
-        let bitmap = font.rasterize(glyph, face).ok()?;
+        let bitmap = if face == SPRITE_FACE {
+            let c = char::from_u32(glyph as u32).unwrap_or(' ');
+            let coverage = sprite::draw(c, font.cell_width, font.cell_height, font.underline_thickness);
+            // Positioned so the bitmap's top-left lands on the cell's top-left.
+            Ok(coverage.map(|coverage| crate::font::GlyphBitmap {
+                width: font.cell_width,
+                height: font.cell_height,
+                left: 0,
+                top: -(font.baseline as i32),
+                pixels: Pixels::Coverage(coverage),
+            }))
+        } else {
+            font.rasterize(face, glyph)
+        };
         let slot = match bitmap {
-            None => None,
-            Some(b) => {
-                let Some((x, y)) = self.shelves.alloc(b.width, b.height) else {
+            Err(e) => {
+                eprintln!("rasterizing glyph {glyph} of face {face} failed: {e}");
+                None
+            }
+            Ok(None) => None,
+            Ok(Some(b)) => {
+                let (atlas, data, color) = match &b.pixels {
+                    Pixels::Coverage(data) => (&mut self.coverage_atlas, data, false),
+                    Pixels::Color(data) => (&mut self.color_atlas, data, true),
+                };
+                let Some((x, y)) = atlas.upload(&self.context, b.width, b.height, data) else {
                     self.atlas_full = true;
                     return None;
                 };
-                let region = D3D11_BOX { left: x, top: y, front: 0, right: x + b.width, bottom: y + b.height, back: 1 };
-                unsafe {
-                    self.context.UpdateSubresource(
-                        &self.atlas,
-                        0,
-                        Some(&region),
-                        b.coverage.as_ptr().cast(),
-                        b.width,
-                        0,
-                    );
-                }
-                Some(Slot { x, y, width: b.width, height: b.height, left: b.left, top: b.top })
+                Some(Slot { x, y, width: b.width, height: b.height, left: b.left, top: b.top, color })
             }
         };
         self.glyphs.insert((face, glyph), slot);
@@ -467,8 +658,7 @@ impl Renderer {
                 MinDepth: 0.0,
                 MaxDepth: 1.0,
             }]));
-            let c = rgba(clear, 1.0);
-            ctx.ClearRenderTargetView(target, &c);
+            ctx.ClearRenderTargetView(target, &rgba(clear, 1.0));
             ctx.IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
             ctx.IASetInputLayout(&self.layout);
             let stride = size_of::<Quad>() as u32;
@@ -477,7 +667,10 @@ impl Renderer {
             ctx.VSSetShader(&self.vertex_shader, None);
             ctx.VSSetConstantBuffers(0, Some(&[Some(self.globals.clone())]));
             ctx.PSSetShader(&self.pixel_shader, None);
-            ctx.PSSetShaderResources(0, Some(&[Some(self.atlas_view.clone())]));
+            ctx.PSSetShaderResources(
+                0,
+                Some(&[Some(self.coverage_atlas.view.clone()), Some(self.color_atlas.view.clone())]),
+            );
             ctx.OMSetBlendState(&self.blend, None, 0xffff_ffff);
             ctx.RSSetState(&self.raster);
             ctx.DrawInstanced(4, count as u32, 0, 0);
@@ -639,6 +832,49 @@ pub mod tests {
         }
     }
 
+    /// A pane with `vt` written to it, rendered offscreen. Returns the pixels
+    /// and the image width.
+    fn render_vt(vt: &[u8], columns: u16, rows: u16) -> (Vec<[u8; 4]>, u32, Font) {
+        let mut renderer = Renderer::with_driver(D3D_DRIVER_TYPE_WARP).unwrap();
+        let mut font = Font::new("Cascadia Code", 12.0, 96).unwrap();
+        let (cw, ch) = (font.cell_width, font.cell_height);
+        let size = SizeReportSize { rows, columns, cell_width: cw, cell_height: ch };
+        let mut pane = Pane::spawn("cmd.exe /c exit", size, || {}, || {}).unwrap();
+        pane.terminal.vt_write(b"\x1b[H\x1b[2J\x1b[?25l");
+        pane.terminal.vt_write(vt);
+        let frame = renderer.draw_pane(&mut pane, &mut font, (0.0, 0.0), true, true).unwrap();
+        let w = cw * columns as u32;
+        let pixels = render_offscreen(&mut renderer, w, ch * rows as u32, frame.background);
+        (pixels, w, font)
+    }
+
+    /// Times queuing a full screen: the libghostty walk, shaping and glyph
+    /// lookups, not GPU work. `cargo test --release frame_build_time -- --ignored --nocapture`
+    #[test]
+    #[ignore = "benchmark"]
+    fn frame_build_time() {
+        let mut renderer = Renderer::with_driver(D3D_DRIVER_TYPE_WARP).unwrap();
+        let mut font = Font::new("Cascadia Code", 12.0, 96).unwrap();
+        let size =
+            SizeReportSize { rows: 40, columns: 120, cell_width: font.cell_width, cell_height: font.cell_height };
+        let mut pane = Pane::spawn("cmd.exe /c exit", size, || {}, || {}).unwrap();
+        let line =
+            "fn main() { let x = a => b != c; println!(\"{x:?}\"); } // \x1b[1mbold\x1b[0m \x1b[32mgreen\x1b[0m ";
+        for _ in 0..40 {
+            pane.terminal.vt_write(&line.repeat(2).as_bytes()[..118]);
+            pane.terminal.vt_write(b"\r\n");
+        }
+        let frames = 200;
+        let start = std::time::Instant::now();
+        for _ in 0..frames {
+            // A full redraw each time, as if every row changed.
+            renderer.draw_pane(&mut pane, &mut font, (0.0, 0.0), true, true).unwrap();
+            renderer.quads.clear();
+        }
+        let per_frame = start.elapsed() / frames;
+        eprintln!("120x40 frame build: {per_frame:?}");
+    }
+
     #[test]
     fn shelves_pack_rows_and_report_full() {
         let mut s = Shelves::default();
@@ -650,25 +886,57 @@ pub mod tests {
 
     #[test]
     fn terminal_text_and_colors_reach_the_pixels() {
-        let mut renderer = Renderer::with_driver(D3D_DRIVER_TYPE_WARP).unwrap();
-        let mut font = Font::new("Cascadia Code", 12.0, 96).unwrap();
-        let (cw, ch) = (font.cell_width, font.cell_height);
-        let size = SizeReportSize { rows: 4, columns: 20, cell_width: cw, cell_height: ch };
-        let mut pane = Pane::spawn("cmd.exe /c exit", size, || {}, || {}).unwrap();
         // Cell 0: a red-background space. Cells 1..: white text on the default background.
-        pane.terminal.vt_write(b"\x1b[H\x1b[2J\x1b[41m \x1b[0mWWWW\x1b[?25l");
-
-        let bg = renderer.draw_pane(&mut pane, &mut font, (0.0, 0.0), true).unwrap();
-        assert_eq!(bg, crate::term::DEFAULT_BACKGROUND);
-        let (w, h) = (cw * 20, ch * 4);
-        let px = render_offscreen(&mut renderer, w, h, bg);
+        let (px, w, font) = render_vt(b"\x1b[41m \x1b[0mWWWW", 20, 4);
+        let (cw, ch) = (font.cell_width, font.cell_height);
         let at = |x: u32, y: u32| px[(y * w + x) as usize];
-
         let red = at(cw / 2, ch / 2);
         assert!(red[2] > 150 && red[2] > red[1] + 60, "cell 0 should be red, got BGRA {red:?}");
-        let corner = at(w - 1, h - 1);
+        let corner = at(w - 1, ch * 4 - 1);
         assert_eq!(&corner[..3], &[0x34, 0x2c, 0x28], "untouched pixels are the default background");
         let ink = (cw..cw * 5).flat_map(|x| (0..ch).map(move |y| (x, y))).filter(|&(x, y)| at(x, y)[1] > 200).count();
         assert!(ink > 20, "the W glyphs should put bright pixels on screen, found {ink}");
+    }
+
+    #[test]
+    fn ligatures_render_differently_from_separate_characters() {
+        // "=>" shaped as one run uses Cascadia's arrow alternates. Overlaying
+        // "=" and " >" rendered on their own shows what no shaping would draw.
+        let (joined, _, _) = render_vt(b"=>", 4, 1);
+        let (equals, _, _) = render_vt(b"=", 4, 1);
+        let (greater, _, _) = render_vt(b" >", 4, 1);
+        let green = |px: &[[u8; 4]]| px.iter().map(|p| p[1]).collect::<Vec<_>>();
+        let apart: Vec<u8> = green(&equals).iter().zip(green(&greater)).map(|(a, b)| (*a).max(b)).collect();
+        assert_ne!(green(&joined), apart);
+    }
+
+    #[test]
+    fn box_lines_are_seamless_across_cells_and_rows() {
+        let (px, w, font) = render_vt("───\r\n │\r\n │".as_bytes(), 3, 3);
+        let (cw, ch) = (font.cell_width, font.cell_height);
+        let lit = |x: u32, y: u32| px[(y * w + x) as usize][1] > 200;
+        let row = (0..ch).find(|&y| lit(cw / 2, y)).expect("the horizontal line");
+        assert!((0..w).all(|x| lit(x, row)), "no gaps between the three cells");
+        let col = (cw..cw * 2).find(|&x| lit(x, ch + ch / 2)).expect("the vertical line");
+        assert!((ch..ch * 3).all(|y| lit(col, y)), "no gap between the two rows");
+    }
+
+    #[test]
+    fn emoji_render_in_color() {
+        let (px, _, _) = render_vt("😀".as_bytes(), 4, 1);
+        // Segoe UI Emoji's grinning face is mostly yellow: red and green high, blue low (BGRA).
+        let yellow = px.iter().filter(|p| p[2] > 180 && p[1] > 140 && p[0] < 100).count();
+        assert!(yellow > 20, "expected yellow emoji pixels, found {yellow}");
+    }
+
+    #[test]
+    fn curly_underlines_wave() {
+        let (px, w, font) = render_vt(b"\x1b[4:3m          ", 10, 1);
+        // Find the top row of underline ink in each column; a wave puts it at
+        // different heights across the run.
+        let ch = font.cell_height;
+        let ink_row = |x: u32| (0..ch).find(|&y| px[(y * w + x) as usize][1] > 120);
+        let heights: std::collections::HashSet<_> = (0..w).filter_map(ink_row).collect();
+        assert!(heights.len() >= 2, "a curly underline should not be flat: {heights:?}");
     }
 }

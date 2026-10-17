@@ -5,6 +5,7 @@ mod font;
 mod input;
 mod pty;
 mod render;
+mod sprite;
 mod term;
 mod window;
 

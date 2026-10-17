@@ -28,6 +28,9 @@ use crate::render::{Renderer, Surface};
 use crate::term::Pane;
 
 const WM_APP_OUTPUT: u32 = WM_APP + 1;
+const BLINK_TIMER: usize = 1;
+/// Ghostty's cursor blink interval.
+const BLINK_MS: u32 = 600;
 const WM_APP_EXITED: u32 = WM_APP + 2;
 const CLASS_NAME: PCWSTR = w!("WispWindow");
 
@@ -50,6 +53,9 @@ pub struct Window {
     pane: Pane,
     dpi: u32,
     focused: bool,
+    /// Blink phase: a blinking cursor shows while this is true.
+    blink_on: bool,
+    blink_timer: bool,
     /// Something changed since the last frame.
     dirty: bool,
     /// The swap chain signaled that it can take a frame, and we haven't used it yet.
@@ -132,6 +138,8 @@ impl Window {
                 dpi,
                 // WM_SETFOCUS sets this once the window is actually activated.
                 focused: false,
+                blink_on: true,
+                blink_timer: false,
                 dirty: true,
                 frame_ready: false,
                 output_pending,
@@ -158,9 +166,39 @@ impl Window {
     fn try_render(&mut self) -> std::result::Result<(), Box<dyn std::error::Error>> {
         let target = self.surface.target(&self.renderer)?;
         let padding = padding_px(self.dpi) as f32;
-        let background = self.renderer.draw_pane(&mut self.pane, &mut self.font, (padding, padding), self.focused)?;
-        self.renderer.render(&target, self.surface.width, self.surface.height, background)?;
-        Ok(self.surface.present()?)
+        let frame =
+            self.renderer.draw_pane(&mut self.pane, &mut self.font, (padding, padding), self.focused, self.blink_on)?;
+        self.renderer.render(&target, self.surface.width, self.surface.height, frame.background)?;
+        self.surface.present()?;
+        self.run_blink_timer(frame.cursor_blinks && self.focused);
+        Ok(())
+    }
+
+    /// Starts or stops the blink timer; it only runs while there's a blinking cursor to show.
+    fn run_blink_timer(&mut self, wanted: bool) {
+        if wanted == self.blink_timer {
+            return;
+        }
+        unsafe {
+            if wanted {
+                SetTimer(Some(self.hwnd), BLINK_TIMER, BLINK_MS, None);
+            } else {
+                let _ = KillTimer(Some(self.hwnd), BLINK_TIMER);
+                self.blink_on = true;
+            }
+        }
+        self.blink_timer = wanted;
+    }
+
+    /// Shows the cursor and restarts its blink period, e.g. after a keypress.
+    fn reset_blink(&mut self) {
+        if !self.blink_on {
+            self.dirty = true;
+        }
+        self.blink_on = true;
+        if self.blink_timer {
+            unsafe { SetTimer(Some(self.hwnd), BLINK_TIMER, BLINK_MS, None) };
+        }
     }
 
     fn resize(&mut self, width: u32, height: u32) {
@@ -222,6 +260,7 @@ impl Window {
             state: control_key_state(extended),
             repeat: (lparam.0 & 0xffff).max(1) as u16,
         };
+        self.reset_blink();
         let mut out = String::new();
         if down {
             // TranslateMessage has already queued the characters this key types.
@@ -354,8 +393,13 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpar
                 );
             }
         }
+        WM_TIMER if wparam.0 == BLINK_TIMER => {
+            window.blink_on = !window.blink_on;
+            window.dirty = true;
+        }
         WM_SETFOCUS | WM_KILLFOCUS => {
             window.focused = msg == WM_SETFOCUS;
+            window.reset_blink();
             window.pane.focus_changed(window.focused);
             window.dirty = true;
         }
