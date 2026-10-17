@@ -42,7 +42,10 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     VIRTUAL_KEY, VK_CAPITAL, VK_CONTROL, VK_DOWN, VK_F4, VK_LWIN, VK_MENU, VK_NUMLOCK, VK_PACKET, VK_PROCESSKEY,
     VK_RWIN, VK_SHIFT, VK_UP,
 };
-use windows::Win32::UI::Shell::ShellExecuteW;
+use windows::Win32::UI::Shell::{
+    ASSOCF_INIT_IGNOREUNKNOWN, ASSOCSTR_EXECUTABLE, AssocQueryStringW, SEE_MASK_CLASSNAME, SEE_MASK_DEFAULT,
+    SHELLEXECUTEINFOW, ShellExecuteExW, ShellExecuteW,
+};
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::{BOOL, HSTRING, PCWSTR, w};
 
@@ -1595,12 +1598,32 @@ fn open_config(hwnd: HWND) {
         let _ = std::fs::write(&path, CONFIG_TEMPLATE);
     }
     let file = HSTRING::from(path.as_os_str());
+    // Nothing opens `.ghostty` files by default, and opening one then shows
+    // Windows' "pick an app" dialog. Unless the user has picked an app, open
+    // it the way `.txt` files open.
+    let mut info = SHELLEXECUTEINFOW {
+        cbSize: size_of::<SHELLEXECUTEINFOW>() as u32,
+        fMask: if has_app(w!(".ghostty")) { SEE_MASK_DEFAULT } else { SEE_MASK_CLASSNAME },
+        hwnd,
+        lpVerb: w!("open"),
+        lpFile: PCWSTR(file.as_ptr()),
+        lpClass: w!(".txt"),
+        nShow: SW_SHOWNORMAL.0,
+        ..Default::default()
+    };
     unsafe {
-        // `.ghostty` files have no editor associated by default; Notepad always works.
-        let opened = ShellExecuteW(Some(hwnd), w!("open"), &file, None, None, SW_SHOWNORMAL);
-        if opened.0 as usize <= 32 {
+        if ShellExecuteExW(&mut info).is_err() {
             ShellExecuteW(Some(hwnd), w!("open"), w!("notepad.exe"), &file, None, SW_SHOWNORMAL);
         }
+    }
+}
+
+/// Whether an app is registered to open files with this extension. Without
+/// one, opening such a file shows Windows' "pick an app" dialog.
+fn has_app(extension: PCWSTR) -> bool {
+    let mut len = 0;
+    unsafe {
+        AssocQueryStringW(ASSOCF_INIT_IGNOREUNKNOWN, ASSOCSTR_EXECUTABLE, extension, w!("open"), None, &mut len).is_ok()
     }
 }
 
@@ -1955,6 +1978,12 @@ pub fn run_message_loop() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unknown_extensions_have_no_app() {
+        assert!(has_app(w!(".txt")));
+        assert!(!has_app(w!(".wisp-no-such-extension")));
+    }
 
     #[test]
     fn conhost_default_titles_give_way_to_the_shell_name() {
