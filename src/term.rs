@@ -41,17 +41,20 @@ pub struct Pane {
 }
 
 impl Pane {
-    /// Starts `command_line` in a new pane. `wake` runs on the reader thread
-    /// whenever output arrives, `exited` once the child process ends.
+    /// Starts `command_line` in a new pane, in `cwd` or the user's home folder.
+    /// `wake` runs on the reader thread whenever output arrives, `exited`
+    /// once the child process ends.
     pub fn spawn(
         command_line: &str,
+        cwd: Option<&str>,
         size: SizeReportSize,
         config: &Config,
         wake: impl Fn() + Send + 'static,
         exited: impl FnOnce() + Send + 'static,
     ) -> Result<Pane, Box<dyn std::error::Error>> {
-        let cwd = std::env::var("USERPROFILE").ok();
-        let (mut pty, mut output) = Pty::spawn(command_line, cwd.as_deref(), size.columns, size.rows)?;
+        let home = std::env::var("USERPROFILE").ok();
+        let cwd = cwd.or(home.as_deref());
+        let (mut pty, mut output) = Pty::spawn(command_line, cwd, size.columns, size.rows)?;
         pty.on_exit(exited);
 
         let (tx, rx) = mpsc::channel();
@@ -192,6 +195,13 @@ impl Pane {
         self.terminal.title().ok().map(str::to_owned)
     }
 
+    /// The working directory the shell last reported (OSC 7), as a Windows path.
+    pub fn working_directory(&self) -> Option<String> {
+        let reported = self.terminal.pwd().ok().filter(|p| !p.is_empty())?;
+        let path = file_url_path(reported);
+        std::path::Path::new(&path).is_dir().then_some(path)
+    }
+
     pub fn write(&self, data: &[u8]) {
         if trace_pty() && !data.is_empty() {
             eprintln!("pty< {}", data.escape_ascii());
@@ -251,6 +261,29 @@ impl Pane {
     }
 }
 
+/// `file://host/C:/Users/me%20too` becomes `C:\Users\me too`; plain paths pass through.
+fn file_url_path(reported: &str) -> String {
+    let Some(rest) = reported.strip_prefix("file://") else { return reported.to_owned() };
+    // Skip the host: the path starts at the next slash.
+    let path = rest.find('/').map_or(rest, |i| &rest[i..]);
+    // `/C:/...` drops its leading slash on Windows.
+    let path = if path.as_bytes().get(2) == Some(&b':') { &path[1..] } else { path };
+    let mut decoded = Vec::with_capacity(path.len());
+    let mut bytes = path.bytes();
+    while let Some(b) = bytes.next() {
+        let hex = |b: Option<u8>| b.and_then(|b| (b as char).to_digit(16));
+        decoded.push(match b {
+            b'%' => match (hex(bytes.next()), hex(bytes.next())) {
+                (Some(hi), Some(lo)) => (hi * 16 + lo) as u8,
+                _ => b'%',
+            },
+            b'/' => b'\\',
+            _ => b,
+        });
+    }
+    String::from_utf8_lossy(&decoded).into_owned()
+}
+
 /// Prepares pasted text for the pty: control characters neutralized, line
 /// breaks sent as Enter, and bracketed paste markers added when asked for.
 fn encode_paste(text: &str, bracketed: bool) -> Vec<u8> {
@@ -295,6 +328,7 @@ mod tests {
         let size = SizeReportSize { rows: 24, columns: 80, cell_width: 9, cell_height: 19 };
         let mut pane = Pane::spawn(
             "cmd.exe /k echo wisp-%COLORTERM%",
+            None,
             size,
             &Config::default(),
             move || {
@@ -324,6 +358,13 @@ mod tests {
     }
 
     #[test]
+    fn osc7_urls_become_windows_paths() {
+        assert_eq!(file_url_path("file://host/C:/Users/me%20too"), "C:\\Users\\me too");
+        assert_eq!(file_url_path("file:///D:/src"), "D:\\src");
+        assert_eq!(file_url_path("C:\\plain"), "C:\\plain");
+    }
+
+    #[test]
     fn pastes_send_one_enter_per_line_and_respect_bracketed_mode() {
         assert_eq!(encode_paste("dir\r\nls\n", false), b"dir\rls\r");
         assert_eq!(encode_paste("a\x1bb", false), b"a b", "escape sequences can't be smuggled in");
@@ -332,7 +373,8 @@ mod tests {
 
     fn pane_with(text: &[u8]) -> Pane {
         let size = SizeReportSize { rows: 5, columns: 20, cell_width: 9, cell_height: 19 };
-        let mut pane = Pane::spawn("cmd.exe /c exit", size, &crate::config::Config::default(), || {}, || {}).unwrap();
+        let mut pane =
+            Pane::spawn("cmd.exe /c exit", None, size, &crate::config::Config::default(), || {}, || {}).unwrap();
         pane.terminal.vt_write(b"\x1b[H\x1b[2J");
         pane.terminal.vt_write(text);
         pane

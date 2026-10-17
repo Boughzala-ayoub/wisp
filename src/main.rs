@@ -2,10 +2,12 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod bindings;
+mod chrome;
 mod clipboard;
 mod config;
 mod font;
 mod input;
+mod layout;
 mod mouse;
 mod pty;
 mod render;
@@ -21,17 +23,31 @@ use windows::Win32::UI::WindowsAndMessaging::{MB_ICONERROR, MessageBoxW};
 use windows::core::{HSTRING, w};
 
 fn main() {
+    startup_mark("main");
+    // Creating the Direct3D device takes longer than everything else at startup
+    // together; start it first and pick it up when the window needs it.
+    let renderer = std::thread::spawn(|| render::Renderer::new().map(render::Prepared));
     let config = config::Config::load();
+    startup_mark("config loaded");
     window::report(&config);
     let result = (|| {
         unsafe { SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2)? };
-        window::Window::open(config)
+        let renderer = move || renderer.join().expect("renderer thread panicked").map(|prepared| prepared.0);
+        window::Window::open(config, renderer)
     })();
     if let Err(e) = result {
         unsafe { MessageBoxW(None, &HSTRING::from(format!("Wisp failed to start:\n\n{e}")), w!("Wisp"), MB_ICONERROR) };
         std::process::exit(1);
     }
     window::run_message_loop();
+}
+
+/// With `WISP_TRACE_STARTUP=1`, logs how long after process start `stage` was reached.
+pub fn startup_mark(stage: &str) {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *ON.get_or_init(|| std::env::var_os("WISP_TRACE_STARTUP").is_some()) {
+        eprintln!("startup {:>6.1} ms  {stage}", ms_since_process_start());
+    }
 }
 
 /// Milliseconds since the OS created this process, loader time included.

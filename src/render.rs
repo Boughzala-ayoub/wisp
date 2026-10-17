@@ -8,26 +8,30 @@ use std::ffi::c_void;
 use libghostty_vt::render::{CursorVisualStyle, Dirty};
 use libghostty_vt::screen::CellWide;
 use libghostty_vt::style::{RgbColor, StyleColor, Underline};
-use windows::Win32::Foundation::{HANDLE, HMODULE, HWND, TRUE};
+use windows::Win32::Foundation::{HANDLE, HMODULE, HWND, RECT, TRUE};
 use windows::Win32::Graphics::Direct3D::Fxc::{D3DCOMPILE_OPTIMIZATION_LEVEL3, D3DCompile};
 use windows::Win32::Graphics::Direct3D::{
     D3D_DRIVER_TYPE, D3D_DRIVER_TYPE_HARDWARE, D3D_DRIVER_TYPE_WARP, D3D_FEATURE_LEVEL_10_0, D3D_FEATURE_LEVEL_10_1,
     D3D_FEATURE_LEVEL_11_0, D3D_FEATURE_LEVEL_11_1, D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP, ID3DBlob,
 };
 use windows::Win32::Graphics::Direct3D11::*;
+use windows::Win32::Graphics::DirectComposition::{
+    DCompositionCreateDevice, IDCompositionDevice, IDCompositionTarget, IDCompositionVisual,
+};
 use windows::Win32::Graphics::Dxgi::Common::{
-    DXGI_ALPHA_MODE_IGNORE, DXGI_FORMAT, DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_R8_UNORM, DXGI_FORMAT_R8G8B8A8_UNORM,
-    DXGI_FORMAT_R32_FLOAT, DXGI_FORMAT_R32_UINT, DXGI_FORMAT_R32G32_FLOAT, DXGI_FORMAT_R32G32B32A32_FLOAT,
-    DXGI_FORMAT_UNKNOWN, DXGI_SAMPLE_DESC,
+    DXGI_ALPHA_MODE_PREMULTIPLIED, DXGI_FORMAT, DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_R8_UNORM,
+    DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_R32_FLOAT, DXGI_FORMAT_R32_UINT, DXGI_FORMAT_R32G32_FLOAT,
+    DXGI_FORMAT_R32G32B32A32_FLOAT, DXGI_FORMAT_UNKNOWN, DXGI_SAMPLE_DESC,
 };
 use windows::Win32::Graphics::Dxgi::{
-    DXGI_MWA_NO_ALT_ENTER, DXGI_PRESENT, DXGI_SCALING_NONE, DXGI_SWAP_CHAIN_DESC1, DXGI_SWAP_CHAIN_FLAG,
+    DXGI_PRESENT, DXGI_SCALING_STRETCH, DXGI_SWAP_CHAIN_DESC1, DXGI_SWAP_CHAIN_FLAG,
     DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT, DXGI_SWAP_EFFECT_FLIP_DISCARD, DXGI_USAGE_RENDER_TARGET_OUTPUT,
     IDXGIDevice, IDXGIFactory2, IDXGISwapChain2,
 };
 use windows::core::{Interface, PCSTR, Result, s};
 
 use crate::font::{BOLD, FaceId, Font, ITALIC, Pixels, ShapedGlyph};
+use crate::layout::Rect;
 use crate::sprite;
 use crate::term::Pane;
 
@@ -247,7 +251,6 @@ impl Theme {
 }
 
 pub struct FrameInfo {
-    pub background: RgbColor,
     /// The cursor is in a blinking mode, so the window should run the blink timer.
     pub cursor_blinks: bool,
 }
@@ -270,6 +273,8 @@ pub struct Renderer {
     pub text_contrast: [f32; 2],
     pub theme: Theme,
     quads: Vec<Quad>,
+    /// Where each clip region starts in `quads`, and its rect.
+    clips: Vec<(usize, Rect)>,
     quad_buffer: Option<(ID3D11Buffer, usize)>,
     // Scratch buffers reused across rows and frames.
     row_cells: Vec<CellPaint>,
@@ -300,6 +305,7 @@ impl Renderer {
                 Some(&mut context),
             )?;
             let device: ID3D11Device = device.unwrap();
+            crate::startup_mark("Direct3D device created");
 
             let vs_code = compile(s!("vs_main"), s!("vs_4_0"))?;
             let ps_code = compile(s!("ps_main"), s!("ps_4_0"))?;
@@ -346,6 +352,8 @@ impl Renderer {
                 FillMode: D3D11_FILL_SOLID,
                 CullMode: D3D11_CULL_NONE,
                 DepthClipEnable: TRUE,
+                // Splits are drawn into one target, each clipped to its own rect.
+                ScissorEnable: TRUE,
                 ..Default::default()
             };
             let mut raster = None;
@@ -376,6 +384,7 @@ impl Renderer {
                 theme: Theme::default(),
                 atlas_full: false,
                 quads: Vec::new(),
+                clips: Vec::new(),
                 quad_buffer: None,
                 row_cells: Vec::new(),
                 row_text: Vec::new(),
@@ -587,11 +596,81 @@ impl Renderer {
         }
 
         snapshot.set_dirty(Dirty::Clean)?;
-        Ok(FrameInfo { background: colors.background, cursor_blinks: cursor_blinks && snapshot.cursor_visible()? })
+        Ok(FrameInfo { cursor_blinks: cursor_blinks && snapshot.cursor_visible()? })
     }
 
     fn solid(&mut self, x: f32, y: f32, width: f32, height: f32, color: [f32; 4]) {
         self.quads.push(Quad { rect: [x, y, width, height], uv: [0.0; 2], color, kind: SOLID, param: 0.0 });
+    }
+
+    /// Everything queued from here on is clipped to `rect`, until the next call.
+    pub fn clip(&mut self, rect: Rect) {
+        self.clips.push((self.quads.len(), rect));
+    }
+
+    /// Fills a rectangle, for window chrome and split dividers.
+    pub fn fill(&mut self, rect: Rect, color: RgbColor, alpha: f32) {
+        self.solid(rect.x as f32, rect.y as f32, rect.width as f32, rect.height as f32, rgba(color, alpha));
+    }
+
+    /// Draws a line of proportional text (tab titles) with its pen at `x` on
+    /// `baseline`, cut short with an ellipsis past `max_width`. Returns its width.
+    #[allow(clippy::too_many_arguments, reason = "text, where, and how")]
+    pub fn text(
+        &mut self,
+        font: &mut Font,
+        text: &str,
+        x: f32,
+        baseline: f32,
+        max_width: f32,
+        color: RgbColor,
+        alpha: f32,
+    ) -> f32 {
+        let lay_out = |font: &mut Font, text: &str| {
+            let mut glyphs = Vec::new();
+            let utf16: Vec<u16> = text.encode_utf16().collect();
+            let _ = font.shape(&utf16, 0, &mut glyphs);
+            let width: f32 = glyphs.iter().map(|g| g.advance).sum();
+            (glyphs, width)
+        };
+        let (mut glyphs, mut width) = lay_out(font, text);
+        if width > max_width {
+            // Drop characters until the text plus an ellipsis fits.
+            let mut chars: Vec<char> = text.chars().collect();
+            while width > max_width && !chars.is_empty() {
+                chars.pop();
+                (glyphs, width) = lay_out(font, &(chars.iter().collect::<String>().trim_end().to_owned() + "\u{2026}"));
+            }
+        }
+        // Glyph offsets are relative to their cluster; clusters follow one another.
+        let (mut pen, mut cluster, mut cluster_width) = (x, u32::MAX, 0.0);
+        for g in glyphs {
+            if g.cluster != cluster {
+                pen += cluster_width;
+                (cluster, cluster_width) = (g.cluster, 0.0);
+            }
+            self.glyph(font, g.face, g.glyph, pen + g.x, baseline - g.y, rgba(color, alpha));
+            cluster_width += g.advance;
+        }
+        width
+    }
+
+    /// Draws a single glyph (an icon) centered in `rect`.
+    pub fn icon(&mut self, font: &mut Font, icon: char, rect: Rect, color: RgbColor, alpha: f32) {
+        let mut glyphs = Vec::new();
+        let mut buf = [0u16; 2];
+        let _ = font.shape(icon.encode_utf16(&mut buf), 0, &mut glyphs);
+        let Some(g) = glyphs.first() else { return };
+        let Some(slot) = self.slot(font, g.face, g.glyph) else { return };
+        let x = rect.x as f32 + (rect.width as f32 - slot.width as f32) / 2.0;
+        let y = rect.y as f32 + (rect.height as f32 - slot.height as f32) / 2.0;
+        self.quads.push(Quad {
+            rect: [x.round(), y.round(), slot.width as f32, slot.height as f32],
+            uv: [slot.x as f32, slot.y as f32],
+            color: rgba(color, alpha),
+            kind: if slot.color { COLOR_GLYPH } else { GLYPH },
+            param: 0.0,
+        });
     }
 
     /// A line drawn by the shader in a repeating pattern of the given period.
@@ -658,8 +737,16 @@ impl Renderer {
         slot
     }
 
-    /// Draws everything queued since the last call into `target`.
-    pub fn render(&mut self, target: &ID3D11RenderTargetView, width: u32, height: u32, clear: RgbColor) -> Result<()> {
+    /// Draws everything queued since the last call into `target`, over a
+    /// background of `clear` at `opacity` (below 1, the window's backdrop shows).
+    pub fn render(
+        &mut self,
+        target: &ID3D11RenderTargetView,
+        width: u32,
+        height: u32,
+        clear: RgbColor,
+        opacity: f32,
+    ) -> Result<()> {
         unsafe {
             let ctx = &self.context;
             let count = self.quads.len();
@@ -695,7 +782,9 @@ impl Renderer {
                 MinDepth: 0.0,
                 MaxDepth: 1.0,
             }]));
-            ctx.ClearRenderTargetView(target, &rgba(clear, 1.0));
+            // Premultiplied, like everything the swap chain composes.
+            let [r, g, b, _] = rgba(clear, 1.0);
+            ctx.ClearRenderTargetView(target, &[r * opacity, g * opacity, b * opacity, opacity]);
             ctx.IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
             ctx.IASetInputLayout(&self.layout);
             let stride = size_of::<Quad>() as u32;
@@ -711,16 +800,45 @@ impl Renderer {
             );
             ctx.OMSetBlendState(&self.blend, None, 0xffff_ffff);
             ctx.RSSetState(&self.raster);
-            ctx.DrawInstanced(4, count as u32, 0, 0);
+            // One draw per clip region; quads before the first `clip` see the whole target.
+            let whole = Rect { x: 0, y: 0, width: width as i32, height: height as i32 };
+            let mut regions = vec![(0, whole)];
+            regions.extend(self.clips.iter().copied());
+            for (i, &(start, rect)) in regions.iter().enumerate() {
+                let end = regions.get(i + 1).map_or(count, |&(next, _)| next);
+                if end <= start {
+                    continue;
+                }
+                ctx.RSSetScissorRects(Some(&[RECT {
+                    left: rect.x,
+                    top: rect.y,
+                    right: rect.x + rect.width,
+                    bottom: rect.y + rect.height,
+                }]));
+                ctx.DrawInstanced(4, (end - start) as u32, 0, start as u32);
+            }
         }
         self.quads.clear();
+        self.clips.clear();
         Ok(())
     }
 }
 
-/// A window's swap chain.
+/// A renderer built on another thread, so creating the Direct3D device (the
+/// slowest part of startup) overlaps with everything else. Direct3D 11 devices
+/// are free-threaded, and the receiving thread is the only one that uses the
+/// context and everything else afterwards.
+pub struct Prepared(pub Renderer);
+
+// SAFETY: see above; the renderer is moved to its one user, never shared.
+unsafe impl Send for Prepared {}
+
+/// A window's swap chain, shown through DirectComposition so its pixels can be
+/// translucent and let the Mica or acrylic backdrop through.
 pub struct Surface {
     swap_chain: IDXGISwapChain2,
+    // Kept alive for as long as the window shows the swap chain.
+    _composition: (IDCompositionDevice, IDCompositionTarget, IDCompositionVisual),
     target: Option<ID3D11RenderTargetView>,
     /// Signaled when the swap chain can take another frame. Waiting on it
     /// before drawing means we always draw with the latest state.
@@ -734,7 +852,8 @@ const SWAP_FLAGS: DXGI_SWAP_CHAIN_FLAG = DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAIT
 impl Surface {
     pub fn new(renderer: &Renderer, hwnd: HWND, width: u32, height: u32) -> Result<Surface> {
         unsafe {
-            let factory: IDXGIFactory2 = renderer.device.cast::<IDXGIDevice>()?.GetAdapter()?.GetParent()?;
+            let dxgi_device: IDXGIDevice = renderer.device.cast()?;
+            let factory: IDXGIFactory2 = dxgi_device.GetAdapter()?.GetParent()?;
             let desc = DXGI_SWAP_CHAIN_DESC1 {
                 Width: width.max(1),
                 Height: height.max(1),
@@ -742,18 +861,33 @@ impl Surface {
                 SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
                 BufferUsage: DXGI_USAGE_RENDER_TARGET_OUTPUT,
                 BufferCount: 2,
-                Scaling: DXGI_SCALING_NONE,
+                // Composition swap chains must stretch; we redraw on every resize anyway.
+                Scaling: DXGI_SCALING_STRETCH,
                 SwapEffect: DXGI_SWAP_EFFECT_FLIP_DISCARD,
-                AlphaMode: DXGI_ALPHA_MODE_IGNORE,
+                AlphaMode: DXGI_ALPHA_MODE_PREMULTIPLIED,
                 Flags: SWAP_FLAGS.0 as u32,
                 ..Default::default()
             };
             let swap_chain: IDXGISwapChain2 =
-                factory.CreateSwapChainForHwnd(&renderer.device, hwnd, &desc, None, None)?.cast()?;
-            factory.MakeWindowAssociation(hwnd, DXGI_MWA_NO_ALT_ENTER)?;
+                factory.CreateSwapChainForComposition(&renderer.device, &desc, None)?.cast()?;
             swap_chain.SetMaximumFrameLatency(1)?;
             let waitable = swap_chain.GetFrameLatencyWaitableObject();
-            Ok(Surface { swap_chain, target: None, waitable, width: width.max(1), height: height.max(1) })
+
+            let composition: IDCompositionDevice = DCompositionCreateDevice(&dxgi_device)?;
+            let target = composition.CreateTargetForHwnd(hwnd, true)?;
+            let visual = composition.CreateVisual()?;
+            visual.SetContent(&swap_chain)?;
+            target.SetRoot(&visual)?;
+            composition.Commit()?;
+
+            Ok(Surface {
+                swap_chain,
+                _composition: (composition, target, visual),
+                target: None,
+                waitable,
+                width: width.max(1),
+                height: height.max(1),
+            })
         }
     }
 
@@ -843,7 +977,7 @@ pub mod tests {
             let texture = texture.unwrap();
             let mut target = None;
             renderer.device.CreateRenderTargetView(&texture, None, Some(&mut target)).unwrap();
-            renderer.render(&target.unwrap(), width, height, clear).unwrap();
+            renderer.render(&target.unwrap(), width, height, clear, 1.0).unwrap();
 
             let staging_desc = D3D11_TEXTURE2D_DESC {
                 Usage: D3D11_USAGE_STAGING,
@@ -877,12 +1011,14 @@ pub mod tests {
         let mut font = Font::new(&["Cascadia Code".into()], 12.0, 96, &[]).unwrap();
         let (cw, ch) = (font.cell_width, font.cell_height);
         let size = SizeReportSize { rows, columns, cell_width: cw, cell_height: ch };
-        let mut pane = Pane::spawn("cmd.exe /c exit", size, &crate::config::Config::default(), || {}, || {}).unwrap();
+        let mut pane =
+            Pane::spawn("cmd.exe /c exit", None, size, &crate::config::Config::default(), || {}, || {}).unwrap();
         pane.terminal.vt_write(b"\x1b[H\x1b[2J\x1b[?25l");
         pane.terminal.vt_write(vt);
-        let frame = renderer.draw_pane(&mut pane, &mut font, (0.0, 0.0), true, true).unwrap();
+        renderer.draw_pane(&mut pane, &mut font, (0.0, 0.0), true, true).unwrap();
         let w = cw * columns as u32;
-        let pixels = render_offscreen(&mut renderer, w, ch * rows as u32, frame.background);
+        let background = crate::config::Config::default().background;
+        let pixels = render_offscreen(&mut renderer, w, ch * rows as u32, background);
         (pixels, w, font)
     }
 
@@ -895,7 +1031,8 @@ pub mod tests {
         let mut font = Font::new(&["Cascadia Code".into()], 12.0, 96, &[]).unwrap();
         let size =
             SizeReportSize { rows: 40, columns: 120, cell_width: font.cell_width, cell_height: font.cell_height };
-        let mut pane = Pane::spawn("cmd.exe /c exit", size, &crate::config::Config::default(), || {}, || {}).unwrap();
+        let mut pane =
+            Pane::spawn("cmd.exe /c exit", None, size, &crate::config::Config::default(), || {}, || {}).unwrap();
         let line =
             "fn main() { let x = a => b != c; println!(\"{x:?}\"); } // \x1b[1mbold\x1b[0m \x1b[32mgreen\x1b[0m ";
         for _ in 0..40 {
@@ -1027,11 +1164,14 @@ pub mod tests {
             let mut font = Font::new(&["Cascadia Code".into()], 12.0, 96, &[]).unwrap();
             let size = SizeReportSize { rows: 1, columns, cell_width: font.cell_width, cell_height: font.cell_height };
             let mut pane =
-                Pane::spawn("cmd.exe /c exit", size, &crate::config::Config::default(), || {}, || {}).unwrap();
+                Pane::spawn("cmd.exe /c exit", None, size, &crate::config::Config::default(), || {}, || {}).unwrap();
             pane.terminal.vt_write(b"\x1b[H\x1b[2J\x1b[?25l");
             pane.terminal.vt_write(text.as_bytes());
-            let frame = renderer.draw_pane(&mut pane, &mut font, (0.0, 0.0), true, true).unwrap();
-            weight(&render_offscreen(&mut renderer, width, height, frame.background), background)
+            renderer.draw_pane(&mut pane, &mut font, (0.0, 0.0), true, true).unwrap();
+            weight(
+                &render_offscreen(&mut renderer, width, height, crate::config::Config::default().background),
+                background,
+            )
         };
         for high in [0.0, 0.25, 0.5, 1.0] {
             let (ink, edges) = ours_with(high);

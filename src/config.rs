@@ -27,6 +27,16 @@ pub enum CursorStyle {
     BlockHollow,
 }
 
+/// What shows through a translucent background (`wisp-backdrop`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Backdrop {
+    /// Acrylic if `background-blur` is on, otherwise plain transparency.
+    Auto,
+    Mica,
+    Acrylic,
+    None,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RightClick {
     CopyOrPaste,
@@ -58,6 +68,9 @@ pub struct Config {
     pub cursor_style_blink: Option<bool>,
     pub background_opacity: f32,
     pub background_blur: bool,
+    pub backdrop: Backdrop,
+    /// How visible unfocused splits stay; the rest is a wash of the background.
+    pub unfocused_split_opacity: f32,
     /// Left/right and top/bottom padding, in points.
     pub window_padding_x: (f32, f32),
     pub window_padding_y: (f32, f32),
@@ -103,6 +116,8 @@ impl Default for Config {
             cursor_style_blink: None,
             background_opacity: 1.0,
             background_blur: false,
+            backdrop: Backdrop::Auto,
+            unfocused_split_opacity: 0.7,
             window_padding_x: (2.0, 2.0),
             window_padding_y: (2.0, 2.0),
             window_width: 100,
@@ -223,6 +238,16 @@ impl Config {
                 "background-opacity" => self.background_opacity = number::<f32>(value)?.clamp(0.0, 1.0),
                 // Ghostty takes true, false or a blur radius; Wisp blurs with the system backdrop.
                 "background-blur" => self.background_blur = value != "false" && value != "0",
+                "wisp-backdrop" => {
+                    self.backdrop = match value.as_str() {
+                        "auto" => Backdrop::Auto,
+                        "mica" => Backdrop::Mica,
+                        "acrylic" => Backdrop::Acrylic,
+                        "none" => Backdrop::None,
+                        _ => return Err(format!("expected auto, mica, acrylic or none, got {value:?}")),
+                    }
+                }
+                "unfocused-split-opacity" => self.unfocused_split_opacity = number::<f32>(value)?.clamp(0.15, 1.0),
                 "window-padding-x" => self.window_padding_x = pair(value)?,
                 "window-padding-y" => self.window_padding_y = pair(value)?,
                 "window-width" => self.window_width = number::<u16>(value)?.max(10),

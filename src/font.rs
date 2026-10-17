@@ -37,6 +37,8 @@ pub struct ShapedGlyph {
     /// Offset from the cluster's pen position, in pixels; `y` points up.
     pub x: f32,
     pub y: f32,
+    /// How far this glyph moves the pen, for laying out proportional text.
+    pub advance: f32,
 }
 
 pub enum Pixels {
@@ -354,6 +356,7 @@ impl Font {
                     cluster: (from + c) as u32,
                     x: pen + offsets[g].advanceOffset,
                     y: offsets[g].ascenderOffset,
+                    advance: advances[g],
                 });
                 pen += advances[g];
             }

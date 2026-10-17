@@ -151,3 +151,39 @@ Things that surprised me:
 - **Ghostty's inline comments aren't comments.** Only a `#` at the start of a line starts one, so
   `background = #282c34` works. I got my own README example wrong at first, writing a comment at
   the end of a line, and the parser would have read it as part of the value.
+
+## M5: tabs, splits and a Windows 11 frame
+
+*2026-10-17*
+
+![Three tabs and three splits over an acrylic backdrop](docs/devlog/m5-tabs-splits.png)
+
+Tabs live in the title bar, Windows Terminal style: Wisp takes the caption's space for its own
+client area and draws the tabs, a new-tab button and the minimize, maximize and close buttons with
+Windows' own icon font. Hovering the maximize button brings up Windows 11's snap layouts, because
+the window tells Windows where that button is. Splits work the way Ghostty's do: Ctrl+Shift+O and
+Ctrl+Shift+E split, Ctrl+Alt+arrows move between panes, dividers drag, unfocused panes fade
+slightly, and a split can zoom to fill its tab. A new tab or split starts in the current pane's
+directory when the shell reports it. `background-opacity` with `background-blur` gives an acrylic
+window, `wisp-backdrop = mica` gives Mica, and F11 or Alt+Enter goes fullscreen.
+
+| | |
+|---|---|
+| Launch to first frame | median 112 ms over eight warm launches, down from 129 ms in M1 |
+| Binary | 2.4 MB, including the 771 themes |
+| Tests | 55, plus 2 opt-in; split geometry and title bar hit testing are unit tested |
+
+Things that surprised me:
+
+- **The Direct3D device was most of startup, not DirectComposition.** I had read that one port
+  measured 156 ms to its first composition frame and expected the same. A startup trace
+  (`WISP_TRACE_STARTUP=1`) put the composition swap chain at 5 ms. Creating the Direct3D device was
+  about 90 ms of a 170 ms start. It now runs on a second thread from the first line of `main`, and
+  the first shell starts while it finishes.
+- **A focus bug hid for four milestones.** The window's initial resize activated it before its
+  state existed, so `WM_SETFOCUS` went nowhere and the cursor stayed hollow. M1 started with
+  "focused" set to true, which masked it. Changing that default to false in M1 is what eventually
+  exposed it, once screenshots stopped faking focus.
+- **Windows has to be told where your buttons are.** Snap layouts, double-click to maximize and
+  dragging all come from answering `WM_NCHITTEST` with the right codes. The buttons are drawn by
+  Wisp, but their behavior is still Windows'.
