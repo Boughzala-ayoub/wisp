@@ -155,7 +155,6 @@ IME preedit (showing text while composing) and Kitty graphics come after MVP.
 
 ## Decisions after review
 
-1. "Wisp" stays the working name, and the project gets renamed before anything is published. The candidates are under [Name clash](#name-clash).
-2. Windows 11 is the target. Without Mica or acrylic the window falls back to a solid background.
-3. Cascadia Code is the default font.
-4. Wisp is a free, MIT-licensed showcase project, not a product.
+1. Windows 11 is the target. Without Mica or acrylic the window falls back to a solid background.
+2. Cascadia Code is the default font.
+3. Wisp is a free, MIT-licensed showcase project.

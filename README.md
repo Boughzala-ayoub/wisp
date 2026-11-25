@@ -1,26 +1,15 @@
 # Wisp
 
-A Windows terminal built on [libghostty-vt](https://github.com/ghostty-org/ghostty), the terminal
-emulation core of Ghostty. The goal is for PowerShell, Claude Code and Codex to feel the way they do
-in Ghostty on a Mac: fast, sharp text, nothing in the way.
-
-> Working name. [WispTerm](https://github.com/xuzhougeng/wispterm) is a different project, and this
-> one gets renamed before any public release.
+A native Windows GPU-accelerated terminal emulator built in Rust on [libghostty-vt](https://github.com/ghostty-org/ghostty) (Ghostty's VT core), Direct3D 11, DirectWrite, and ConPTY — engineered so PowerShell, WSL, Claude Code, and Codex feel crisp and fast on Windows.
 
 ![Wisp demo: Catppuccin ligatures & color emoji, tabs & splits over acrylic backdrop, WSL2/Git Bash/PowerShell tabs, and Claude Code](docs/demo.webp)
 
-## Status
+## Highlights
 
-Early, but all seven milestones of the first plan are done. PowerShell runs through ConPTY, text
-renders with ligatures, color emoji, font fallback and seamless box drawing, the mouse selects,
-scrolls and reaches programs that track it, a Ghostty-format config with themes and keybinds
-reloads live (`Ctrl+Shift+,`), and the window has tabs in its title bar, Ghostty-style splits, acrylic or Mica, and
-fullscreen. A menu opens PowerShell, Command Prompt, Git Bash or any WSL distribution, running on
-Microsoft's newer ConPTY when it's bundled.
-
-Single-machine measurements on a mid-range laptop: 110 ms median to first present, 0.8–0.9 ms median key-to-present (13–14 ms p95), and 23 MiB/s in a WSL `cat` test with bundled ConPTY.
-[DEVLOG.md](DEVLOG.md) has the numbers per milestone and how each was measured. [PLAN.md](PLAN.md)
-has the research and the milestones.
+- **GPU-accelerated Direct3D 11 & DirectWrite rendering** — ligatures, color emoji, font fallback, and pixel-aligned box-drawing sprites in a single instanced draw call.
+- **Native Windows chrome & layout** — title-bar tabs, Ghostty-style splits, acrylic/Mica backdrop, fullscreen, and shell launcher for PowerShell, Command Prompt, Git Bash, and WSL distributions (using bundled ConPTY when present).
+- **Ghostty-compatible configuration** — 771 built-in Ghostty themes (with automatic Windows light/dark switching), custom keybinds, and live reload (`Ctrl+Shift+,`).
+- **Measured single-machine performance (mid-range laptop):** 110 ms median to first present, 0.8–0.9 ms median key-to-present (13–14 ms p95), and 23 MiB/s in a WSL `cat` test with bundled ConPTY. See [DEVLOG.md](DEVLOG.md) for per-milestone measurements and scripts.
 
 ## How it works
 
