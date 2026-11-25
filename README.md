@@ -7,19 +7,18 @@ in Ghostty on a Mac: fast, sharp text, nothing in the way.
 > Working name. [WispTerm](https://github.com/xuzhougeng/wispterm) is a different project, and this
 > one gets renamed before any public release.
 
-![Wisp with three tabs and three splits over an acrylic backdrop](docs/devlog/m5-tabs-splits.png)
+![Wisp demo: Catppuccin ligatures & color emoji, tabs & splits over acrylic backdrop, WSL2/Git Bash/PowerShell tabs, and Claude Code](docs/demo.webp)
 
 ## Status
 
 Early, but all seven milestones of the first plan are done. PowerShell runs through ConPTY, text
 renders with ligatures, color emoji, font fallback and seamless box drawing, the mouse selects,
 scrolls and reaches programs that track it, a Ghostty-format config with themes and keybinds
-applies live, and the window has tabs in its title bar, Ghostty-style splits, acrylic or Mica, and
+reloads live (`Ctrl+Shift+,`), and the window has tabs in its title bar, Ghostty-style splits, acrylic or Mica, and
 fullscreen. A menu opens PowerShell, Command Prompt, Git Bash or any WSL distribution, running on
 Microsoft's newer ConPTY when it's bundled.
 
-On a mid-range laptop Wisp shows its first frame 110 ms after launch, turns a keypress into a
-finished frame in under a millisecond at the median, and streams `cat` output from WSL at 23 MB/s.
+Single-machine measurements on a mid-range laptop: 110 ms median to first present, 0.8–0.9 ms median key-to-present (13–14 ms p95), and 23 MiB/s in a WSL `cat` test with bundled ConPTY.
 [DEVLOG.md](DEVLOG.md) has the numbers per milestone and how each was measured. [PLAN.md](PLAN.md)
 has the research and the milestones.
 
